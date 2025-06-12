@@ -1,0 +1,60 @@
+pipeline {
+    agent any
+
+    environment {
+        REMOTE_HOST = "10.20.30.40"       // 🖥️ your JMeter VM IP
+        JMETER_USER = "your-username"     // 👤 SSH username on remote VM
+        JMETER_CRED = "jmeter-remote-vm"  // 🔐 Jenkins credential ID
+    }
+
+    stages {
+        stage('Checkout Repo') {
+            steps {
+                git url: 'https://github.hdfcbank.com/HDFCBANK/jmeter-performance.git', branch: 'perf-june'
+            }
+        }
+
+        stage('Copy JMX to Remote VM') {
+            steps {
+                sshagent([env.JMETER_CRED]) {
+                    sh '''
+                        scp -o StrictHostKeyChecking=no testplan.jmx $JMETER_USER@$REMOTE_HOST:/home/$JMETER_USER/testplan.jmx
+                    '''
+                }
+            }
+        }
+
+        stage('Run JMeter Remotely') {
+            steps {
+                sshagent([env.JMETER_CRED]) {
+                    sh '''
+                        ssh -o StrictHostKeyChecking=no $JMETER_USER@$REMOTE_HOST '
+                            mkdir -p ~/reports &&
+                            jmeter -n -t ~/testplan.jmx -l ~/reports/results.jtl -e -o ~/reports/output
+                        '
+                    '''
+                }
+            }
+        }
+
+        stage('Copy Report Back') {
+            steps {
+                sshagent([env.JMETER_CRED]) {
+                    sh '''
+                        scp -o StrictHostKeyChecking=no -r $JMETER_USER@$REMOTE_HOST:/home/$JMETER_USER/reports ./reports
+                    '''
+                }
+            }
+        }
+
+        stage('Publish HTML Report') {
+            steps {
+                publishHTML(target: [
+                    reportDir: 'reports/output',
+                    reportFiles: 'index.html',
+                    reportName: 'JMeter Test Report'
+                ])
+            }
+        }
+    }
+}
