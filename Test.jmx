@@ -1,6 +1,13 @@
 pipeline {
     agent any
 
+    environment {
+        VM_IP = '10.216.55.34'
+        VM_USER = 'hdfcbank'
+        VM_PASS = 'hdfc@123'
+        DATE_TAG = sh(script: 'date +%F', returnStdout: true).trim()  // gets YYYY-MM-DD
+    }
+
     stages {
         stage('Clone Repo') {
             steps {
@@ -8,46 +15,43 @@ pipeline {
             }
         }
 
-        stage('Upload .jmx File to Remote JMeter Path') {
+        stage('Upload .jmx File') {
             steps {
                 script {
-                    def vm = '10.216.55.34'
-                    def pwd = 'hdfc@123'
-                    def remoteJmxPath = '/home1/QK/MBR/scripts/MBR_R1_Perf1_Sanity_Usecase_Flows_30-Nov-2023/MBR_PT_U1_100U_270Ct.jmx'
-
+                    def remoteJmx = "/home1/QK/MBR/scripts/MBR_R1_Perf1_Sanity_Usecase_Flows_30-Nov-2023/MBR_PT_U1_100U_270Ct.jmx"
                     sh """
-                        sshpass -p '${pwd}' scp -o StrictHostKeyChecking=no testplan.jmx hdfcbank@${vm}:${remoteJmxPath}
+                        sshpass -p '${VM_PASS}' scp -o StrictHostKeyChecking=no testplan.jmx ${VM_USER}@${VM_IP}:${remoteJmx}
                     """
                 }
             }
         }
 
-        stage('Run JMeter Test on Remote VM') {
+        stage('Run JMeter') {
             steps {
                 script {
-                    def vm = '10.216.55.34'
-                    def pwd = 'hdfc@123'
-                    def jtlPath = '/home1/QK/MBR/Results/R28_100U_270Ct.jtl'
-                    def htmlReportPath = '/home1/QK/MBR/HTMLReports/27Oct_MBR.html'
+                    def reportDir = "/home1/QK/MBR/HTMLReports/MBR_Report_${env.DATE_TAG}"
+                    def resultFile = "/home1/QK/MBR/Results/MBR_Result_${env.DATE_TAG}.jtl"
+                    def remoteJmx = "/home1/QK/MBR/scripts/MBR_R1_Perf1_Sanity_Usecase_Flows_30-Nov-2023/MBR_PT_U1_100U_270Ct.jmx"
 
                     sh """
-                        sshpass -p '${pwd}' ssh -o StrictHostKeyChecking=no hdfcbank@${vm} '
+                        sshpass -p '${VM_PASS}' ssh -o StrictHostKeyChecking=no ${VM_USER}@${VM_IP} '
+                            mkdir -p ${reportDir} &&
                             /home1/apache-jmeter-5.4.2_bkKP/bin/jmeter.sh -n \
-                            -t ${remoteJmxPath} \
-                            -l ${jtlPath} \
-                            -e -o ${htmlReportPath}
+                            -t ${remoteJmx} \
+                            -l ${resultFile} \
+                            -e -o ${reportDir}
                         '
                     """
                 }
             }
         }
 
-        stage('Copy HTML Report to Jenkins') {
+        stage('Copy Report Back') {
             steps {
                 sh """
                     mkdir -p reports
-                    sshpass -p 'hdfc@123' scp -o StrictHostKeyChecking=no -r \
-                    hdfcbank@10.216.55.34:/home1/QK/MBR/HTMLReports/27Oct_MBR.html ./reports/
+                    sshpass -p '${VM_PASS}' scp -o StrictHostKeyChecking=no -r \
+                    ${VM_USER}@${VM_IP}:/home1/QK/MBR/HTMLReports/MBR_Report_${DATE_TAG} ./reports/
                 """
             }
         }
@@ -55,9 +59,9 @@ pipeline {
         stage('Publish Report') {
             steps {
                 publishHTML(target: [
-                    reportDir: 'reports',
-                    reportFiles: '27Oct_MBR.html',
-                    reportName: 'MBR JMeter Report'
+                    reportDir: "reports/MBR_Report_${env.DATE_TAG}",
+                    reportFiles: 'index.html',
+                    reportName: "MBR Report (${env.DATE_TAG})"
                 ])
             }
         }
