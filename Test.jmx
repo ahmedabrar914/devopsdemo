@@ -1,74 +1,82 @@
 pipeline {
-    agent any
+  agent any
 
-    stages {
-        stage('Clone Repo') {
-            steps {
-                checkout scm
-            }
-        }
+  environment {
+    VM             = '10.216.33.52'                          // your JMeter VM IP
+    USER           = 'hdfcbank'                              // SSH user on that VM
+    PASS           = 'PerfTest@1'                            // SSH password
+    JMETER_BIN     = '/home1/jmeter/bin/jmeter.sh'           // full path to jmeter.sh on VM
+    REMOTE_SCRIPT  = '/home1/QK/MBR/scripts'                 // where your .jmx files live
+    REMOTE_RESULTS = '/home1/QK/MBR/Results'                 // where JMeter should write the .jtl
+    REMOTE_HTML    = '/home1/QK/MBR/HTML_Reports'            // base folder for HTML reports
+  }
 
-        stage('Upload .jmx with Current Date') {
-            steps {
-                script {
-                    def vm = '10.216.55.34'
-                    def pwd = 'hdfc@123'
-                    def dateStr = new Date().format("ddMMMyyyy")  // e.g., 12Jun2025
-                    def remoteJmxFile = "MBR_Test_${dateStr}.jmx"
-                    def remoteJmxPath = "/home1/QK/MBR/scripts/MBR_R1_Perf1_Sanity_Usecase_Flows_30-Nov-2023/${remoteJmxFile}"
-
-                    // Save full path for later use
-                    env.REMOTE_JMX_PATH = remoteJmxPath
-                    env.REMOTE_JMX_FILE = remoteJmxFile
-
-                    sh """
-                        sshpass -p '${pwd}' scp -o StrictHostKeyChecking=no testplan.jmx hdfcbank@${vm}:${remoteJmxPath}
-                    """
-                }
-            }
-        }
-
-        stage('Run JMeter with Dynamic JMX') {
-            steps {
-                script {
-                    def vm = '10.216.55.34'
-                    def pwd = 'hdfc@123'
-                    def jtlPath = "/home1/QK/MBR/Results/R28_${env.REMOTE_JMX_FILE.replace('.jmx','.jtl')}"
-                    def htmlPath = "/home1/QK/MBR/HTMLReports/Report_${env.REMOTE_JMX_FILE.replace('.jmx','.html')}"
-
-                    // Save HTML path for pull step
-                    env.REMOTE_HTML_PATH = htmlPath
-
-                    sh """
-                        sshpass -p '${pwd}' ssh -o StrictHostKeyChecking=no hdfcbank@${vm} '
-                            /home1/apache-jmeter-5.4.2_bkKP/bin/jmeter.sh -n \
-                            -t ${env.REMOTE_JMX_PATH} \
-                            -l ${jtlPath} \
-                            -e -o ${htmlPath}
-                        '
-                    """
-                }
-            }
-        }
-
-        stage('Copy HTML Report') {
-            steps {
-                sh """
-                    mkdir -p reports
-                    sshpass -p 'hdfc@123' scp -o StrictHostKeyChecking=no -r \
-                    hdfcbank@10.216.55.34:${env.REMOTE_HTML_PATH} ./reports/
-                """
-            }
-        }
-
-        stage('Publish Report') {
-            steps {
-                publishHTML(target: [
-                    reportDir: 'reports',
-                    reportFiles: "${env.REMOTE_HTML_PATH.tokenize('/')[-1]}",
-                    reportName: 'Dynamic JMeter Report'
-                ])
-            }
-        }
+  stages {
+    stage('Checkout') {
+      steps {
+        // brings testplan.jmx (and anything else) into workspace
+        checkout scm
+      }
     }
+
+    stage('Run JMeter on Remote VM') {
+      steps {
+        script {
+          // name of your JMX in the repo:
+          def jmxName    = 'testplan.jmx'
+
+          // compute the remote paths
+          def remoteJmx  = "${env.REMOTE_SCRIPT}/${jmxName}"
+          def remoteJtl  = "${env.REMOTE_RESULTS}/${jmxName.replace('.jmx','.jtl')}"
+          def reportDir  = "${env.REMOTE_HTML}/${jmxName.replace('.jmx','')}"
+          // we’ll need this for the fetch stage:
+          env.REPORT_DIR = reportDir
+
+          // 1) copy up the JMX (overwrites if it exists)
+          sh """
+            sshpass -p '${env.PASS}' scp -o StrictHostKeyChecking=no \
+              ${jmxName} \
+              ${env.USER}@${env.VM}:${remoteJmx}
+          """
+
+          // 2) run JMeter (clean old report first, then execute)
+          sh """
+            sshpass -p '${env.PASS}' ssh -o StrictHostKeyChecking=no ${env.USER}@${env.VM} '
+              rm -rf ${reportDir} &&
+              ${env.JMETER_BIN} -n \\
+                -t ${remoteJmx} \\
+                -l ${remoteJtl} \\
+                -e -o ${reportDir}
+            '
+          """
+
+          // 3) debug: list what actually got created
+          sh """
+            sshpass -p '${env.PASS}' ssh -o StrictHostKeyChecking=no ${env.USER}@${env.VM} '
+              echo "→ JTL file:"; ls -lh ${remoteJtl} || echo "   MISSING!"
+              echo "→ HTML report dir:"; ls -l ${reportDir} || echo "   MISSING!"
+            '
+          """
+        }
+      }
+    }
+
+    stage('Fetch & Publish HTML Report') {
+      steps {
+        // bring back the entire folder
+        sh """
+          mkdir -p reports/output
+          sshpass -p '${env.PASS}' scp -o StrictHostKeyChecking=no -r \\
+            ${env.USER}@${env.VM}:\${REPORT_DIR}/* reports/output/
+        """
+
+        // publish index.html
+        publishHTML(target: [
+          reportDir:   'reports/output',
+          reportFiles: 'index.html',
+          reportName:  'JMeter Test Report'
+        ])
+      }
+    }
+  }
 }
