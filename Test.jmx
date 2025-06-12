@@ -1,53 +1,48 @@
 pipeline {
     agent any
 
-    environment {
-        REMOTE_HOST = "10.20.30.40"       // 🖥️ your JMeter VM IP
-        JMETER_USER = "your-username"     // 👤 SSH username on remote VM
-        JMETER_CRED = "jmeter-remote-vm"  // 🔐 Jenkins credential ID
-    }
-
     stages {
-        stage('Checkout Repo') {
+        stage('Clone Repository') {
             steps {
-                git url: 'https://github.hdfcbank.com/HDFCBANK/jmeter-performance.git', branch: 'perf-june'
-            }
-        }
-
-        stage('Copy JMX to Remote VM') {
-            steps {
-                sshagent([env.JMETER_CRED]) {
-                    sh '''
-                        scp -o StrictHostKeyChecking=no testplan.jmx $JMETER_USER@$REMOTE_HOST:/home/$JMETER_USER/testplan.jmx
-                    '''
+                script {
+                    checkout scm  // clone the current repo
                 }
             }
         }
 
-        stage('Run JMeter Remotely') {
+        stage('Run JMeter on Remote Machine') {
             steps {
-                sshagent([env.JMETER_CRED]) {
-                    sh '''
-                        ssh -o StrictHostKeyChecking=no $JMETER_USER@$REMOTE_HOST '
-                            mkdir -p ~/reports &&
-                            jmeter -n -t ~/testplan.jmx -l ~/reports/results.jtl -e -o ~/reports/output
+                script {
+                    // Define remote VM and credentials
+                    def vm = '10.216.55.34'             // your JMeter VM IP
+                    def pwd = 'hdfc@123'                // password for SSH
+                    def jmxFilePath = 'testplan.jmx'    // path to JMX file in repo
+                    def remoteDir = '/tmp/jmeter-run'   // temp dir on remote machine
+
+                    // Transfer the .jmx to remote machine
+                    sh """
+                        sshpass -p '${pwd}' ssh -o StrictHostKeyChecking=no hdfcbank@${vm} 'mkdir -p ${remoteDir}'
+                        sshpass -p '${pwd}' scp -o StrictHostKeyChecking=no ${jmxFilePath} hdfcbank@${vm}:${remoteDir}/
+                    """
+
+                    // Run JMeter remotely
+                    sh """
+                        sshpass -p '${pwd}' ssh -o StrictHostKeyChecking=no hdfcbank@${vm} '
+                            mkdir -p ${remoteDir}/output &&
+                            jmeter -n -t ${remoteDir}/testplan.jmx -l ${remoteDir}/results.jtl -e -o ${remoteDir}/output
                         '
-                    '''
+                    """
+
+                    // Bring the report back to Jenkins for publishing
+                    sh """
+                        mkdir -p reports
+                        sshpass -p '${pwd}' scp -o StrictHostKeyChecking=no -r hdfcbank@${vm}:${remoteDir}/output ./reports/
+                    """
                 }
             }
         }
 
-        stage('Copy Report Back') {
-            steps {
-                sshagent([env.JMETER_CRED]) {
-                    sh '''
-                        scp -o StrictHostKeyChecking=no -r $JMETER_USER@$REMOTE_HOST:/home/$JMETER_USER/reports ./reports
-                    '''
-                }
-            }
-        }
-
-        stage('Publish HTML Report') {
+        stage('Publish Report') {
             steps {
                 publishHTML(target: [
                     reportDir: 'reports/output',
