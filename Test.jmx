@@ -1,13 +1,6 @@
 pipeline {
     agent any
 
-    environment {
-        VM_IP = '10.216.55.34'
-        VM_USER = 'hdfcbank'
-        VM_PASS = 'hdfc@123'
-        DATE_TAG = sh(script: 'date +%F', returnStdout: true).trim()  // gets YYYY-MM-DD
-    }
-
     stages {
         stage('Clone Repo') {
             steps {
@@ -15,43 +8,55 @@ pipeline {
             }
         }
 
-        stage('Upload .jmx File') {
+        stage('Upload .jmx with Current Date') {
             steps {
                 script {
-                    def remoteJmx = "/home1/QK/MBR/scripts/MBR_R1_Perf1_Sanity_Usecase_Flows_30-Nov-2023/MBR_PT_U1_100U_270Ct.jmx"
+                    def vm = '10.216.55.34'
+                    def pwd = 'hdfc@123'
+                    def dateStr = new Date().format("ddMMMyyyy")  // e.g., 12Jun2025
+                    def remoteJmxFile = "MBR_Test_${dateStr}.jmx"
+                    def remoteJmxPath = "/home1/QK/MBR/scripts/MBR_R1_Perf1_Sanity_Usecase_Flows_30-Nov-2023/${remoteJmxFile}"
+
+                    // Save full path for later use
+                    env.REMOTE_JMX_PATH = remoteJmxPath
+                    env.REMOTE_JMX_FILE = remoteJmxFile
+
                     sh """
-                        sshpass -p '${VM_PASS}' scp -o StrictHostKeyChecking=no testplan.jmx ${VM_USER}@${VM_IP}:${remoteJmx}
+                        sshpass -p '${pwd}' scp -o StrictHostKeyChecking=no testplan.jmx hdfcbank@${vm}:${remoteJmxPath}
                     """
                 }
             }
         }
 
-        stage('Run JMeter') {
+        stage('Run JMeter with Dynamic JMX') {
             steps {
                 script {
-                    def reportDir = "/home1/QK/MBR/HTMLReports/MBR_Report_${env.DATE_TAG}"
-                    def resultFile = "/home1/QK/MBR/Results/MBR_Result_${env.DATE_TAG}.jtl"
-                    def remoteJmx = "/home1/QK/MBR/scripts/MBR_R1_Perf1_Sanity_Usecase_Flows_30-Nov-2023/MBR_PT_U1_100U_270Ct.jmx"
+                    def vm = '10.216.55.34'
+                    def pwd = 'hdfc@123'
+                    def jtlPath = "/home1/QK/MBR/Results/R28_${env.REMOTE_JMX_FILE.replace('.jmx','.jtl')}"
+                    def htmlPath = "/home1/QK/MBR/HTMLReports/Report_${env.REMOTE_JMX_FILE.replace('.jmx','.html')}"
+
+                    // Save HTML path for pull step
+                    env.REMOTE_HTML_PATH = htmlPath
 
                     sh """
-                        sshpass -p '${VM_PASS}' ssh -o StrictHostKeyChecking=no ${VM_USER}@${VM_IP} '
-                            mkdir -p ${reportDir} &&
+                        sshpass -p '${pwd}' ssh -o StrictHostKeyChecking=no hdfcbank@${vm} '
                             /home1/apache-jmeter-5.4.2_bkKP/bin/jmeter.sh -n \
-                            -t ${remoteJmx} \
-                            -l ${resultFile} \
-                            -e -o ${reportDir}
+                            -t ${env.REMOTE_JMX_PATH} \
+                            -l ${jtlPath} \
+                            -e -o ${htmlPath}
                         '
                     """
                 }
             }
         }
 
-        stage('Copy Report Back') {
+        stage('Copy HTML Report') {
             steps {
                 sh """
                     mkdir -p reports
-                    sshpass -p '${VM_PASS}' scp -o StrictHostKeyChecking=no -r \
-                    ${VM_USER}@${VM_IP}:/home1/QK/MBR/HTMLReports/MBR_Report_${DATE_TAG} ./reports/
+                    sshpass -p 'hdfc@123' scp -o StrictHostKeyChecking=no -r \
+                    hdfcbank@10.216.55.34:${env.REMOTE_HTML_PATH} ./reports/
                 """
             }
         }
@@ -59,9 +64,9 @@ pipeline {
         stage('Publish Report') {
             steps {
                 publishHTML(target: [
-                    reportDir: "reports/MBR_Report_${env.DATE_TAG}",
-                    reportFiles: 'index.html',
-                    reportName: "MBR Report (${env.DATE_TAG})"
+                    reportDir: 'reports',
+                    reportFiles: "${env.REMOTE_HTML_PATH.tokenize('/')[-1]}",
+                    reportName: 'Dynamic JMeter Report'
                 ])
             }
         }
