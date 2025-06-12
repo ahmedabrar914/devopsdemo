@@ -2,9 +2,9 @@ pipeline {
   agent any
 
   environment {
-    VM             = '10.216.33.52'                          // your JMeter VM IP
-    USER           = 'hdfcbank'                              // SSH user on that VM
-    PASS           = 'PerfTest@1'                            // SSH password
+    VM             = ''                          // your JMeter VM IP
+    USER           = ''                              // SSH user on that VM
+    PASS           = '1'                            // SSH password
     JMETER_BIN     = '/home1/jmeter/bin/jmeter.sh'           // full path to jmeter.sh on VM
     REMOTE_SCRIPT  = '/home1/QK/MBR/scripts'                 // where your .jmx files live
     REMOTE_RESULTS = '/home1/QK/MBR/Results'                 // where JMeter should write the .jtl
