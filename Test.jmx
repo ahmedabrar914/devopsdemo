@@ -2,7 +2,7 @@ pipeline {
   agent any
 
   environment {
-    // JMeter VM
+    // ────────── JMeter VM ──────────
     JM_VM        = '10.216.33.52'
     JM_USER      = 'hdfcbank'
     JM_PASS      = 'PerfTest@1'
@@ -11,29 +11,43 @@ pipeline {
     JM_RESULTS   = '/home1/QK/MBR/Results'
     JM_HTML      = '/home1/QK/MBR/HTML_Reports'
 
-    // Pod-check VM
+    // ────────── Pod-check VM ──────────
     POD_VM       = '10.216.33.44'
     POD_USER     = 'hdfcbank'
     POD_PASS     = 'perf@123'
-    POD_NAME     = 'user-profile-v1'
     POD_NS       = 'perf-mc'
+    APP_LABEL    = 'user-profile-v1'   // your Deployment’s app label
   }
 
   stages {
     stage('Wait for Pod to be Running') {
       steps {
         script {
+          // give it up to 10 minutes before failing
           timeout(time: 10, unit: 'MINUTES') {
             waitUntil {
-              def status = sh(
+              // exactly the same sshpass-ssh pattern as your JMeter stage
+              def nonRunning = sh(
                 script: """
-                  sshpass -p '${POD_PASS}' ssh -o StrictHostKeyChecking=no ${POD_USER}@${POD_VM} \\
-                    kubectl get pod ${POD_NAME} -n ${POD_NS} -o jsonpath='{.status.phase}'
+                  sshpass -p '${POD_PASS}' ssh -o StrictHostKeyChecking=no \\
+                    ${POD_USER}@${POD_VM} '
+                      kubectl get pods -n ${POD_NS} -l app=${APP_LABEL} \\
+                        --field-selector=status.phase!=Running --no-headers || true
+                    '
                 """,
                 returnStdout: true
               ).trim()
-              echo "→ ${POD_NAME} status: ${status}"
-              return (status == 'Running')
+
+              if (nonRunning) {
+                echo """
+Pods not yet Running:
+${nonRunning}
+"""
+                return false   // loop again
+              } else {
+                echo "✅ All pods for app=${APP_LABEL} are Running"
+                return true    // exit waitUntil
+              }
             }
           }
         }
@@ -53,7 +67,6 @@ pipeline {
           def remoteJmx = "${JM_SCRIPTS}/${jmxName}"
           def remoteJtl = "${JM_RESULTS}/${jmxName.replace('.jmx','.jtl')}"
           def reportDir = "${JM_HTML}/${jmxName.replace('.jmx','')}"
-
           env.REPORT_DIR = reportDir
 
           // 1) copy JMX
@@ -63,7 +76,7 @@ pipeline {
               ${JM_USER}@${JM_VM}:${remoteJmx}
           """
 
-          // 2) run JMeter (clear old results & generate HTML)
+          // 2) run JMeter
           sh """
             sshpass -p '${JM_PASS}' ssh -o StrictHostKeyChecking=no ${JM_USER}@${JM_VM} '
               rm -rf ${reportDir} &&
@@ -74,7 +87,7 @@ pipeline {
             '
           """
 
-          // 3) debug
+          // 3) debug listing
           sh """
             sshpass -p '${JM_PASS}' ssh -o StrictHostKeyChecking=no ${JM_USER}@${JM_VM} '
               echo "→ JTL file:"; ls -lh ${remoteJtl} || echo "   MISSING!"
