@@ -2,19 +2,46 @@ pipeline {
   agent any
 
   environment {
-    VM             = ''                          // your JMeter VM IP
-    USER           = ''                              // SSH user on that VM
-    PASS           = '1'                            // SSH password
-    JMETER_BIN     = '/home1/jmeter/bin/jmeter.sh'           // full path to jmeter.sh on VM
-    REMOTE_SCRIPT  = '/home1/QK/MBR/scripts'                 // where your .jmx files live
-    REMOTE_RESULTS = '/home1/QK/MBR/Results'                 // where JMeter should write the .jtl
-    REMOTE_HTML    = '/home1/QK/MBR/HTML_Reports'            // base folder for HTML reports
+    // JMeter VM
+    JM_VM        = '10.216.33.52'
+    JM_USER      = 'hdfcbank'
+    JM_PASS      = 'PerfTest@1'
+    JM_BIN       = '/home1/jmeter/bin/jmeter.sh'
+    JM_SCRIPTS   = '/home1/QK/MBR/scripts'
+    JM_RESULTS   = '/home1/QK/MBR/Results'
+    JM_HTML      = '/home1/QK/MBR/HTML_Reports'
+
+    // Pod-check VM
+    POD_VM       = '10.216.33.44'
+    POD_USER     = 'hdfcbank'
+    POD_PASS     = 'perf@123'
+    POD_NAME     = 'user-profile-v1'
+    POD_NS       = 'perf-mc'
   }
 
   stages {
+    stage('Wait for Pod to be Running') {
+      steps {
+        script {
+          timeout(time: 10, unit: 'MINUTES') {
+            waitUntil {
+              def status = sh(
+                script: """
+                  sshpass -p '${POD_PASS}' ssh -o StrictHostKeyChecking=no ${POD_USER}@${POD_VM} \\
+                    kubectl get pod ${POD_NAME} -n ${POD_NS} -o jsonpath='{.status.phase}'
+                """,
+                returnStdout: true
+              ).trim()
+              echo "→ ${POD_NAME} status: ${status}"
+              return (status == 'Running')
+            }
+          }
+        }
+      }
+    }
+
     stage('Checkout') {
       steps {
-        // brings testplan.jmx (and anything else) into workspace
         checkout scm
       }
     }
@@ -22,37 +49,34 @@ pipeline {
     stage('Run JMeter on Remote VM') {
       steps {
         script {
-          // name of your JMX in the repo:
-          def jmxName    = 'testplan.jmx'
+          def jmxName   = 'testplan.jmx'
+          def remoteJmx = "${JM_SCRIPTS}/${jmxName}"
+          def remoteJtl = "${JM_RESULTS}/${jmxName.replace('.jmx','.jtl')}"
+          def reportDir = "${JM_HTML}/${jmxName.replace('.jmx','')}"
 
-          // compute the remote paths
-          def remoteJmx  = "${env.REMOTE_SCRIPT}/${jmxName}"
-          def remoteJtl  = "${env.REMOTE_RESULTS}/${jmxName.replace('.jmx','.jtl')}"
-          def reportDir  = "${env.REMOTE_HTML}/${jmxName.replace('.jmx','')}"
-          // we’ll need this for the fetch stage:
           env.REPORT_DIR = reportDir
 
-          // 1) copy up the JMX (overwrites if it exists)
+          // 1) copy JMX
           sh """
-            sshpass -p '${env.PASS}' scp -o StrictHostKeyChecking=no \
-              ${jmxName} \
-              ${env.USER}@${env.VM}:${remoteJmx}
+            sshpass -p '${JM_PASS}' scp -o StrictHostKeyChecking=no \\
+              ${jmxName} \\
+              ${JM_USER}@${JM_VM}:${remoteJmx}
           """
 
-          // 2) run JMeter (clean old report first, then execute)
+          // 2) run JMeter (clear old results & generate HTML)
           sh """
-            sshpass -p '${env.PASS}' ssh -o StrictHostKeyChecking=no ${env.USER}@${env.VM} '
+            sshpass -p '${JM_PASS}' ssh -o StrictHostKeyChecking=no ${JM_USER}@${JM_VM} '
               rm -rf ${reportDir} &&
-              ${env.JMETER_BIN} -n \\
+              ${JM_BIN} -f -n \\
                 -t ${remoteJmx} \\
                 -l ${remoteJtl} \\
                 -e -o ${reportDir}
             '
           """
 
-          // 3) debug: list what actually got created
+          // 3) debug
           sh """
-            sshpass -p '${env.PASS}' ssh -o StrictHostKeyChecking=no ${env.USER}@${env.VM} '
+            sshpass -p '${JM_PASS}' ssh -o StrictHostKeyChecking=no ${JM_USER}@${JM_VM} '
               echo "→ JTL file:"; ls -lh ${remoteJtl} || echo "   MISSING!"
               echo "→ HTML report dir:"; ls -l ${reportDir} || echo "   MISSING!"
             '
@@ -63,14 +87,11 @@ pipeline {
 
     stage('Fetch & Publish HTML Report') {
       steps {
-        // bring back the entire folder
         sh """
           mkdir -p reports/output
-          sshpass -p '${env.PASS}' scp -o StrictHostKeyChecking=no -r \\
-            ${env.USER}@${env.VM}:\${REPORT_DIR}/* reports/output/
+          sshpass -p '${JM_PASS}' scp -o StrictHostKeyChecking=no -r \\
+            ${JM_USER}@${JM_VM}:\${REPORT_DIR}/* reports/output/
         """
-
-        // publish index.html
         publishHTML(target: [
           reportDir:   'reports/output',
           reportFiles: 'index.html',
