@@ -1,1 +1,31 @@
-test demo
+kubelet_config {
+  cpu_cfs_quota      = lookup(
+    var.kubelet_config,
+    each.value.linux_node_pool_name,
+    {
+      cpu_cfs_quota      = false
+      pod_pids_limit     = 0
+      cpu_manager_policy = ""
+    }
+  ).cpu_cfs_quota
+
+  pod_pids_limit     = lookup(
+    var.kubelet_config,
+    each.value.linux_node_pool_name,
+    {
+      cpu_cfs_quota      = false
+      pod_pids_limit     = 0
+      cpu_manager_policy = ""
+    }
+  ).pod_pids_limit
+
+  cpu_manager_policy = lookup(
+    var.kubelet_config,
+    each.value.linux_node_pool_name,
+    {
+      cpu_cfs_quota      = false
+      pod_pids_limit     = 0
+      cpu_manager_policy = ""
+    }
+  ).cpu_manager_policy
+}
