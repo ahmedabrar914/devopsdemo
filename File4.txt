@@ -1,20 +1,19 @@
 dynamic "backend" {
-  for_each = merge([
-    for b in coalesce(var.backend_service_config.backends, []) : [
-      for group_key, group_val in b.groups : {
-        key = group_key
-        group = group_val.group
-        balancing_mode = group_val.balancing_mode
-        capacity_scaler = group_val.capacity_scaler
-        description = group_val.description
-        failover = group_val.failover
-        max_connections_per_group = try(group_val.max_connections.per_group, null)
-        max_connections_per_endpoint = try(group_val.max_connections.per_endpoint, null)
-        max_connections_per_instance = try(group_val.max_connections.per_instance, null)
-        max_utilization = lookup(group_val, "max_utilization", null)
-      }
-    ]
-  ]...)
+  for_each = merge({
+    for group_key, group_val in var.backend_service_config.backends[0].groups :
+    group_key => {
+      group           = group_val.group
+      balancing_mode  = group_val.balancing_mode
+      capacity_scaler = group_val.capacity_scaler
+      description     = group_val.description
+      failover        = group_val.failover
+
+      max_connections_per_group   = try(group_val.max_connections.per_group, null)
+      max_connections_per_endpoint = try(group_val.max_connections.per_endpoint, null)
+      max_connections_per_instance = try(group_val.max_connections.per_instance, null)
+      max_utilization             = lookup(group_val, "max_utilization", null)
+    }
+  })
 
   content {
     group                         = backend.value.group
