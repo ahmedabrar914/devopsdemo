@@ -2,7 +2,7 @@ pipeline {
   agent any
 
   environment {
-    // ────────── JMeter VM ──────────
+    // JMeter VM details
     JM_VM        = '10.216.33.52'
     JM_USER      = 'hdfcbank'
     JM_PASS      = 'PerfTest@1'
@@ -11,42 +11,46 @@ pipeline {
     JM_RESULTS   = '/home1/QK/MBR/Results'
     JM_HTML      = '/home1/QK/MBR/HTML_Reports'
 
-    // ────────── Pod-check VM ──────────
-    POD_VM       = '10.216.33.44'
-    POD_USER     = 'hdfcbank'
-    POD_PASS     = 'perf@123'
-    POD_NS       = 'perf-mc'
-    APP_LABEL    = 'user-profile-v1'   // your Deployment’s app label
+    // K8s node details
+    K8S_VM       = '10.216.33.20'
+    K8S_USER     = 'hdfcbank'
+    K8S_PASS     = 'perf@123'
+    NAMESPACE    = 'perf-mc'
+    APP_LABEL    = 'user-profile-v1'
   }
 
   stages {
-    stage('Wait for Pod to be Running') {
+    stage('Wait for Pods to be Running and Ready') {
       steps {
         script {
-          // give it up to 10 minutes before failing
           timeout(time: 10, unit: 'MINUTES') {
             waitUntil {
-              // exactly the same sshpass-ssh pattern as your JMeter stage
-              def nonRunning = sh(
+              def podStatus = sh(
                 script: """
-                  sshpass -p '${POD_PASS}' ssh -o StrictHostKeyChecking=no \\
-                    ${POD_USER}@${POD_VM} '
-                      kubectl get pods -n ${POD_NS} -l app=${APP_LABEL} \\
-                        --field-selector=status.phase!=Running --no-headers || true
-                    '
+                  sshpass -p '${K8S_PASS}' ssh -o StrictHostKeyChecking=no ${K8S_USER}@${K8S_VM} '
+                    kubectl get pods -n ${NAMESPACE} -l app=${APP_LABEL} -o json
+                  '
                 """,
                 returnStdout: true
               ).trim()
 
-              if (nonRunning) {
-                echo """
-Pods not yet Running:
-${nonRunning}
-"""
-                return false   // loop again
+              // Parse pod status using Groovy's JsonSlurper
+              def json = new groovy.json.JsonSlurper().parseText(podStatus)
+              def notReady = []
+              for (pod in json.items) {
+                def phase = pod.status.phase
+                def allReady = pod.status.containerStatuses?.every { it.ready }
+                if (phase != 'Running' || !allReady) {
+                  notReady << pod.metadata.name
+                }
+              }
+
+              if (notReady) {
+                echo "Pods not yet Running and Ready: ${notReady.join(', ')}"
+                return false
               } else {
-                echo "✅ All pods for app=${APP_LABEL} are Running"
-                return true    // exit waitUntil
+                echo "✅ All pods for app=${APP_LABEL} are Running and Ready"
+                return true
               }
             }
           }
@@ -69,14 +73,14 @@ ${nonRunning}
           def reportDir = "${JM_HTML}/${jmxName.replace('.jmx','')}"
           env.REPORT_DIR = reportDir
 
-          // 1) copy JMX
+          // 1) Copy JMX file to JMeter VM
           sh """
             sshpass -p '${JM_PASS}' scp -o StrictHostKeyChecking=no \\
               ${jmxName} \\
               ${JM_USER}@${JM_VM}:${remoteJmx}
           """
 
-          // 2) run JMeter
+          // 2) Run JMeter test remotely
           sh """
             sshpass -p '${JM_PASS}' ssh -o StrictHostKeyChecking=no ${JM_USER}@${JM_VM} '
               rm -rf ${reportDir} &&
@@ -87,7 +91,7 @@ ${nonRunning}
             '
           """
 
-          // 3) debug listing
+          // 3) Debug: List output files
           sh """
             sshpass -p '${JM_PASS}' ssh -o StrictHostKeyChecking=no ${JM_USER}@${JM_VM} '
               echo "→ JTL file:"; ls -lh ${remoteJtl} || echo "   MISSING!"
