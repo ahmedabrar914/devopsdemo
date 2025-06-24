@@ -1,1 +1,31 @@
-demo test
+
+import requests
+
+def trigger_jenkins_build(jenkins_url, username, password):
+    """
+    Trigger a Jenkins job using the REST API and HTTP Basic Auth.
+    Args:
+        jenkins_url (str): The URL to trigger the build (ends with /build or /buildWithParameters).
+        username (str): Jenkins username.
+        password (str): Jenkins password or API token.
+    """
+    try:
+        response = requests.post(jenkins_url, auth=(username, password))
+        if response.status_code in (200, 201):
+            print("✅ Jenkins build triggered successfully!")
+        elif response.status_code == 403:
+            print("❌ Authentication failed (403 Forbidden). Check username/password or API token.")
+        else:
+            print(f"❌ Failed to trigger Jenkins build: HTTP {response.status_code}")
+            print(response.text)
+    except Exception as e:
+        print(f"Error connecting to Jenkins: {e}")
+
+if __name__ == "__main__":
+    # ==== Update these variables ====
+    jenkins_url = "http://<jenkins-server>:8080/job/<job-name>/build"
+    username = "your-jenkins-username"
+    password = "your-jenkins-password-or-api-token"
+    # ================================
+
+    trigger_jenkins_build(jenkins_url, username, password)
