@@ -1,1 +1,56 @@
-demo
+import subprocess
+import requests
+
+def deploy_service(text_file, env, env_namespace):
+    with open(text_file, 'r') as file:
+        first_col_values = file.readlines()
+
+    # Execute Helm upgrade for each unique service in the first column
+    for items in first_col_values:
+        service = items.split(":")[0].strip()
+        microservices = items.split(":")[1].strip()
+        env_namespace = env_namespace.strip()
+        command = f"helm upgrade --install {microservices} helm-charts -f helm-charts/{env}-values/{service}.yaml -n {env_namespace}"
+        result = subprocess.run(command, shell=True, check=True)
+        print(f"{service} : {microservices} end")
+    return result
+
+def trigger_jenkins_build(jenkins_url, username, api_token):
+    """
+    Trigger a Jenkins job using the REST API and HTTP Basic Auth.
+    Args:
+        jenkins_url (str): The URL to trigger the build (ends with /build?token=...).
+        username (str): Jenkins username.
+        api_token (str): Jenkins API token.
+    """
+    try:
+        response = requests.post(jenkins_url, auth=(username, api_token))
+        if response.status_code in (200, 201):
+            print("✅ Jenkins build triggered successfully!")
+        elif response.status_code == 403:
+            print("❌ Authentication failed (403 Forbidden). Check username/API token and job permissions.")
+        else:
+            print(f"❌ Failed to trigger Jenkins build: HTTP {response.status_code}")
+            print(response.text)
+    except Exception as e:
+        print(f"Error connecting to Jenkins: {e}")
+
+def main():
+    env_name = "perf"
+    namespace = "perf-mc"
+    if not env_name:
+        print("Error: ENV is not set.")
+
+    text_file_path = f"helm-charts/{env_name}-values/{env_name}.txt"
+    deployment = deploy_service(text_file_path, env_name, namespace)
+
+    # === Jenkins Trigger Settings ===
+    jenkins_url = "https://jenkins-master1.hdfcbank.com/job/EF_Mobile_Banking/job/jmeter-performance/build?token=JMETER_TOKEN"
+    username = "MGXR3936"
+    api_token = "1bb1ab6b768513a156061d4747f610e32f2ea"  # Use your real API token here
+
+    # Trigger Jenkins job after deploy
+    trigger_jenkins_build(jenkins_url, username, api_token)
+
+if __name__ == "__main__":
+    main()
