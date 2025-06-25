@@ -2,7 +2,7 @@ pipeline {
   agent any
 
   environment {
-    // JMeter VM details
+    // JMeter VM
     JM_VM        = '10.216.33.52'
     JM_USER      = 'hdfcbank'
     JM_PASS      = 'PerfTest@1'
@@ -11,15 +11,56 @@ pipeline {
     JM_RESULTS   = '/home1/QK/MBR/Results'
     JM_HTML      = '/home1/QK/MBR/HTML_Reports'
 
-    // K8s node details
+    // K8s node
     K8S_VM       = '10.216.33.20'
     K8S_USER     = 'hdfcbank'
     K8S_PASS     = 'perf@123'
     NAMESPACE    = 'perf-mc'
+    DEPLOYMENT   = 'user-profile-v1'
     APP_LABEL    = 'user-profile-v1'
+
+    // File to track last seen generation
+    GEN_FILE     = 'last_deploy_generation.txt'
   }
 
   stages {
+    stage('Check for New Deployment') {
+      steps {
+        script {
+          // Get current deployment generation
+          def currentGeneration = sh(
+            script: """
+              sshpass -p '${K8S_PASS}' ssh -o StrictHostKeyChecking=no ${K8S_USER}@${K8S_VM} \\
+                "kubectl get deployment ${DEPLOYMENT} -n ${NAMESPACE} -o=jsonpath='{.metadata.generation}'"
+            """,
+            returnStdout: true
+          ).trim()
+
+          echo "Current deployment generation: ${currentGeneration}"
+
+          // Read last seen generation, or set to empty if file doesn't exist
+          def lastGeneration = ''
+          if (fileExists(env.GEN_FILE)) {
+            lastGeneration = readFile(env.GEN_FILE).trim()
+          }
+
+          echo "Last seen generation: ${lastGeneration}"
+
+          if (currentGeneration == lastGeneration) {
+            echo "No new deployment detected. Exiting pipeline."
+            // Gracefully exit without error
+            currentBuild.result = 'SUCCESS'
+            // Prevent further stages
+            error("No new deployment. Stopping.")
+          } else {
+            echo "New deployment detected. Proceeding..."
+            // Save new generation for next run
+            writeFile(file: env.GEN_FILE, text: currentGeneration)
+          }
+        }
+      }
+    }
+
     stage('Wait for Pods to be Running and Ready') {
       steps {
         script {
@@ -34,7 +75,6 @@ pipeline {
                 returnStdout: true
               ).trim()
 
-              // Parse pod status using Groovy's JsonSlurper
               def json = new groovy.json.JsonSlurper().parseText(podStatus)
               def notReady = []
               for (pod in json.items) {
