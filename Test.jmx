@@ -158,3 +158,39 @@ pipeline {
     }
   }
 }
+
+
+pipeline {
+  agent any
+
+  environment {
+    JM_VM      = '10.216.33.52'
+    JM_USER    = 'hdfcbank'
+    JM_PASS    = 'PerfTest@1'
+    JM_HTML    = '/home1/QK/MBR/HTML_Reports'
+    REPORT_DIR = 'billpay'   // or whatever your folder name is
+  }
+
+  stages {
+    // ... your earlier stages (running JMeter etc.) ...
+
+    stage('Fetch & Publish HTML Report') {
+      steps {
+        script {
+          // Remote full path of the report directory
+          def remoteReportDir = "${JM_HTML}/${REPORT_DIR}"
+        }
+        sh """
+          mkdir -p reports/output
+          sshpass -p '${JM_PASS}' scp -o StrictHostKeyChecking=no -r \\
+            ${JM_USER}@${JM_VM}:${JM_HTML}/${REPORT_DIR}/* reports/output/
+        """
+        publishHTML(target: [
+          reportDir:   'reports/output',
+          reportFiles: 'index.html',
+          reportName:  'JMeter Test Report'
+        ])
+      }
+    }
+  }
+}
