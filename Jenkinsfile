@@ -203,3 +203,20 @@ stage('Fetch & Publish HTML Report') {
     }
   }
 }
+
+
+
+
+
+stage('Send Teams Notification') {
+  steps {
+    script {
+      def reportUrl = "${env.BUILD_URL}JMeter_Test_Report/"
+      def teamsWebhookUrl = 'https://outlook.office.com/webhook/...' // your Teams webhook URL
+      def payload = /{"text": "JMeter Test Report: ${reportUrl}"}/
+      sh """
+        curl -H 'Content-Type: application/json' -d '${payload}' '${teamsWebhookUrl}'
+      """
+    }
+  }
+}
