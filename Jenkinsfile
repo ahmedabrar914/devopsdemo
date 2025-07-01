@@ -177,3 +177,29 @@ pipeline {
     }
   }
 }
+
+
+
+stage('Fetch & Publish HTML Report') {
+  steps {
+    script {
+      def reportSubdir = jmxName.replace('.jmx', '')
+      sh """
+        mkdir -p reports
+        sshpass -p '${JM_PASS}' scp -o StrictHostKeyChecking=no -r \
+          ${JM_USER}@${JM_VM}:'${REPORT_DIR}' reports/
+      """
+      publishHTML(target: [
+        reportDir: "reports/${reportSubdir}",
+        reportFiles: 'index.html',
+        reportName: 'JMeter Test Report',
+        allowMissing: false,
+        keepAll: true,
+        alwaysLinkToLastBuild: true,
+        escapeUnderscores: false,
+        allowJs: true
+      ])
+      archiveArtifacts artifacts: "reports/${reportSubdir}/**", fingerprint: true
+    }
+  }
+}
