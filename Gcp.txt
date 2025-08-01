@@ -1,5 +1,5 @@
 for zone in $(gcloud compute zones list --format="value(name)"); do
-  for vm in $(gcloud compute instances list --zones=$zone --format="value(name)"); do
+  for vm in $(gcloud compute instances list --zone="$zone" --format="value(name)"); do
     disk=$(gcloud compute instances describe "$vm" --zone="$zone" --format="value(disks[0].deviceName)")
     image=$(gcloud compute disks describe "$disk" --zone="$zone" --format="value(sourceImage.basename())")
     if [[ -n "$image" ]]; then
