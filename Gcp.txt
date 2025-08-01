@@ -1,8 +1,19 @@
-for zone in $(gcloud compute zones list --format="value(name)"); do
+for zone in asia-south1-a asia-south1-b asia-south1-c; do
+  echo "🔍 Checking zone: $zone"
   vms=$(gcloud compute instances list --filter="zone:($zone)" --format="value(name)")
   for vm in $vms; do
-    disk=$(gcloud compute instances describe "$vm" --zone="$zone" --format="value(disks[0].deviceName)")
-    image=$(gcloud compute disks describe "$disk" --zone="$zone" --format="value(sourceImage.basename())")
-    echo "DEBUG: $vm | $zone | $disk | $image"
+    echo "🔄 Processing VM: $vm in $zone"
+    
+    disk_uri=$(gcloud compute instances describe "$vm" --zone="$zone" --format="value(disks[0].source)")
+    
+    # Extract disk name and zone from URI
+    disk_name=$(basename "$disk_uri")
+    disk_zone=$(echo "$disk_uri" | cut -d'/' -f9)
+    
+    # Describe the disk safely
+    image=$(gcloud compute disks describe "$disk_name" --zone="$disk_zone" --format="value(sourceImage.basename())")
+    snapshot=$(gcloud compute disks describe "$disk_name" --zone="$disk_zone" --format="value(sourceSnapshot.basename())")
+    
+    echo -e "✅ $vm\t$disk_zone\tImage: ${image:-"-"}\tSnapshot: ${snapshot:-"-"}"
   done
 done
