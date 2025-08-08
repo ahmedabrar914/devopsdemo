@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: istio-ingressgateway
+  namespace: {{ .Values.controllerConfig.namespace }}
+  labels:
+    app: istio-ingressgateway
+spec:
+  replicas: 30
+  selector:
+    matchLabels:
+      app: istio-ingressgateway
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+  template:
+    metadata:
+      annotations:
+        inject.istio.io/templates: gateway
+      labels:
+        app: istio-ingressgateway
+    spec:
+      containers:
+        - name: istio-proxy
+          image: auto
+          imagePullPolicy: IfNotPresent
+          resources:
+            limits:
+              cpu: "4"
+              memory: "4Gi"
+            requests:
+              cpu: "1"
+              memory: "1536Mi"
+      terminationGracePeriodSeconds: 30
+      serviceAccountName: istio-ingressgateway
