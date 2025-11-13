@@ -1,0 +1,6 @@
+kubectl get po -n perf-mc -o wide \
+| awk 'NR>1{print $1,$7}' \
+| while read pod node; do \
+    zone=$(kubectl get node "$node" -o jsonpath='{.metadata.labels.topology\.kubernetes\.io/zone}'); \
+    echo "$pod  $zone"; \
+done
