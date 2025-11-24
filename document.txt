@@ -1,0 +1,210 @@
+JMeter Jenkins Pipeline – How It Works (Handover Document)
+
+1. Introduction
+
+This pipeline is created to automatically run a JMeter load test every time a new deployment happens on the Kubernetes cluster.
+It checks if the application deployment is updated, waits until the pods are healthy, runs the JMeter test on a remote VM, fetches the results, publishes the report, and finally sends a notification to Microsoft Teams.
+
+This document explains each stage, what commands are executed, and why they are used.
+
+⸻
+
+2. How the Pipeline Works (Step-by-Step)
+
+Below is the entire logic in simple terms.
+
+⸻
+
+Step 1: Check If New Deployment Happened
+
+What it does
+	•	Connects to the Kubernetes jump server using SSH.
+	•	Runs:
+kubectl get deployment <deployment-name> -o jsonpath={.metadata.generation}
+
+•	This gives the deployment “generation number”.
+
+Why this is needed
+	•	Every time you apply a new deployment, Kubernetes increases this generation value.
+	•	We store the last value in a file last_deploy_generation.txt.
+
+Logic
+	•	If generation number is same as last time → No update.
+	•	If generation number changed → New deployment detected.
+
+Action
+	•	If same, pipeline stops.
+	•	If new, pipeline continues and writes the new generation into the file.
+
+⸻
+
+Step 2: Wait Until Pods Are Running and Ready
+
+What it does
+	•	Continuously checks pod status using:
+kubectl get pods -l app=<app-label> -o json
+
+•	Reads each pod’s:
+	•	status.phase (should be Running)
+	•	containerStatuses.ready (should be true)
+
+Why this is needed
+
+Before running load tests, the application must be stable.
+We ensure all pods are fully ready.
+
+Outcome
+	•	If any pod is not ready → it waits.
+	•	If all pods are ready → next stage starts.
+
+⸻
+
+Step 3: Checkout Git Code
+
+What it does
+	•	Pulls the latest code from the Git repository.
+	•	The .jmx file for JMeter test comes from this repo.
+
+Why this is needed
+
+To ensure the JMeter test script is always the latest version.
+
+⸻
+
+Step 4: Upload JMeter Script to Remote VM
+
+What it does
+	•	Uses SCP to copy testplan.jmx to the JMeter VM:
+sshpass scp testplan.jmx hdfcbank@<jm_vm>:/home1/QK/MBR/scripts
+
+Why this is needed
+
+The JMeter test runs on a separate VM dedicated for load testing.
+
+⸻
+
+Step 5: Run JMeter Test on the Remote VM
+
+What it does
+
+Runs the JMeter command on VM:
+
+jmeter.sh -n -t <testfile.jmx> -l <results.jtl> -e -o <html_report_dir>
+
+•	-n: Non-GUI mode
+	•	-t: JMX test file
+	•	-l: JTL result file
+	•	-e -o: Generate HTML dashboard
+
+Why this is needed
+
+The JMeter VM generates:
+	•	Raw results (.jtl)
+	•	HTML summary report
+
+It also cleans old reports
+
+Before running the test, old report folders are removed:
+rm -rf <report_directory>
+
+Step 6: Fetch JMeter HTML Report Back to Jenkins
+
+What it does
+	•	Creates a reports/ folder in Jenkins.
+	•	Downloads the entire HTML report directory:
+scp -r <jm_vm>:<html_report_dir> reports/output
+
+Step 8: Publish Report in Jenkins UI
+
+What it does
+
+Uses Jenkins HTML Publisher:
+publishHTML(reportDir: "reports/<folder>", reportFiles: "index.html")
+
+Why this is needed
+	•	Report becomes visible inside Jenkins build page.
+	•	Stored permanently for future reference.
+	•	You don’t need to manually fetch it.
+
+⸻
+
+Step 9: Send Microsoft Teams Notification
+
+What it does
+
+Sends a webhook message to Teams:
+
+curl -H 'Content-Type: application/json' \
+     -d '{"text": "JMeter Test Report: <url>"}' \
+     <teams-webhook-url>
+
+Why this is needed
+	•	Team gets notified automatically.
+	•	They can quickly check performance results.
+
+⸻
+
+3. Full Flow Summary (Easy to Understand)
+
+Step
+What Happens
+Why
+1
+Check deployment generation
+Detect if new deployment occurred
+2
+Wait for pods to become ready
+Ensure application is stable
+3
+Checkout code
+Get latest JMX
+4
+Copy JMX to JMeter VM
+Prepare test environment
+5
+Run JMeter script
+Generate results
+6
+Fetch HTML report
+Save in Jenkins
+7
+Start HTTP server
+Live viewing of report
+8
+Publish report
+Easy access for team
+9
+Send Teams notification
+Inform team about results
+
+4. What You Need to Maintain
+
+The new team member should know:
+
+Mandatory Access
+	•	SSH access to JMeter VM
+	•	SSH access to Kubernetes jump server
+	•	Jenkins job configuration
+
+Files to Know
+	•	testplan.jmx
+	•	last_deploy_generation.txt
+	•	HTML report folder
+
+Troubleshooting Checklist
+	•	If pods are not ready → check application logs
+	•	If report not generated → check JMeter VM
+	•	If Teams message fails → check webhook
+	•	If pipeline stops early → check generation number logic
+
+⸻
+
+5. Final Notes
+	•	Credentials are currently plain text → should later be moved to Jenkins credentials store.
+	•	JMeter VM must always have enough CPU/MEM.
+	•	Jenkins agent should have:
+	•	sshpass
+	•	python3
+	•	HTML Publisher plugin
+
+
