@@ -1,0 +1,301 @@
+Below is a clean, interview-style, production-ready handover document explaining your Jenkins pipeline end-to-end. It is written so another engineering team can immediately understand how the pipeline works, why each stage exists, and how to maintain or modify it.
+
+⸻
+
+📘 Jenkins Pipeline – Detailed Handover Document
+
+1. Objective of This Pipeline
+
+This CICD pipeline is designed to:
+	1.	Detect if a new Kubernetes deployment has occurred for a specific microservice.
+	2.	Wait until the new pods are Running & Ready.
+	3.	Trigger a JMeter performance test from a remote JMeter VM.
+	4.	Fetch the generated HTML results back to Jenkins.
+	5.	Publish the performance test report inside Jenkins.
+	6.	Notify the team via Microsoft Teams.
+	7.	Prevent unnecessary test runs when no new deployment is detected.
+
+⸻
+
+2. High-Level Flow
+
+K8s deployment updated?
+        |
+        |-- No → Stop pipeline (avoid unnecessary JMeter tests)
+        |
+        |-- Yes → Wait for new pods to be Ready → Run JMeter test
+                                |
+                                → Fetch report → Publish HTML → Notify Teams
+
+
+⸻
+
+3. Environment Variables
+
+The pipeline defines all operational details inside the environment block:
+
+🔹 JMeter VM Details
+
+Variable	Purpose
+JM_VM	JMeter VM IP
+JM_USER/JM_PASS	SSH credentials
+JM_BIN	Path to jmeter.sh
+JM_SCRIPTS	Folder where test plans (.jmx) are copied
+JM_RESULTS	Location where .jtl files are generated
+JM_HTML	Folder where HTML reports are created
+
+
+⸻
+
+🔹 Kubernetes (Perf Cluster) Details
+
+Variable	Purpose
+K8S_VM	K8s master / jumpbox VM
+K8S_USER/K8S_PASS	SSH access for kubectl commands
+NAMESPACE	Namespace of the application
+DEPLOYMENT	Deployment name
+APP_LABEL	Label selector to fetch pods
+
+
+⸻
+
+🔹 Pipeline Utility Variables
+
+Variable	Purpose
+GEN_FILE	File storing last deployment generation number
+JM_REPORT_DIR	Captures JMeter HTML report path dynamically
+
+
+⸻
+
+4. Stage-by-Stage Explanation
+
+⸻
+
+🧩 Stage 1 — Check for New Deployment
+
+Purpose
+
+Avoid running JMeter test if there is no new deployment.
+
+How It Works
+	•	Reads Kubernetes deployment .metadata.generation via SSH.
+	•	Compares with the generation stored in last_deploy_generation.txt.
+	•	If same → exits the pipeline.
+	•	If different → updates the file and continues.
+
+Outcome
+
+✔ Prevents unnecessary load on your JMeter VM
+✔ Ensures test runs only after deployment
+
+⸻
+
+🧩 Stage 2 — Wait for Pods to be Running & Ready
+
+Purpose
+
+Ensure new pods finish rolling out successfully.
+
+How It Works
+	•	Uses kubectl get pods -l app=… via SSH.
+	•	Parses JSON to check:
+	•	Pod phase = Running
+	•	All containers ready = true
+
+It loops until either:
+	•	All pods are ready → continue
+	•	Timeout (10 minutes) → fail
+
+Outcome
+
+✔ Ensures JMeter test runs only on a stable environment.
+
+⸻
+
+🧩 Stage 3 — Checkout Source Code
+
+Pulls the test plan .jmx file and supporting scripts from SCM (Git).
+
+⸻
+
+🧩 Stage 4 — Run JMeter on Remote VM
+
+Steps inside this stage:
+
+1️⃣ Copy .jmx file to JMeter VM
+
+scp testplan.jmx → /home1/QK/MBR/scripts/
+
+2️⃣ Run the test remotely
+
+jmeter.sh -n -t testplan.jmx -l results.jtl -e -o HTML_Report_Dir
+
+	•	-n → non-GUI mode
+	•	-l → generate .jtl summary
+	•	-e -o dir → generate HTML dashboard
+
+3️⃣ Debug logs
+
+Lists report folder and JTL file for verification.
+
+⸻
+
+🧩 Stage 5 — Fetch JMeter HTML Report back to Jenkins
+
+How It Works
+	•	Creates a local reports/output/ directory.
+	•	Downloads the entire HTML folder from JMeter VM using SCP.
+
+Example Path:
+
+remote: /home1/QK/MBR/HTML_Reports/testplan/
+local : workspace/reports/output/
+
+
+⸻
+
+🧩 Stage 6 — Serve HTML Report via HTTP (Optional for easy viewing)
+
+What it does:
+	•	Starts a lightweight Python HTTP server:
+
+python3 -m http.server 8888
+
+	•	Provides the browsing URL in Jenkins logs:
+
+http://<jenkins-agent-ip>:8888/
+
+This helps testers to quickly open the full dashboard.
+
+⸻
+
+🧩 Stage 7 — Publish HTML Report in Jenkins
+
+What it does:
+	•	Stores HTML report within Jenkins as build artifacts.
+	•	Makes it available in “JMeter Test Report” link.
+
+Outcome
+
+✔ Historical retention of performance results
+✔ Easy comparison between builds
+
+⸻
+
+🧩 Stage 8 — Send Teams Notification
+
+What it does
+	•	Uses Teams Webhook URL.
+	•	Sends a JSON payload containing report link.
+
+Example Payload:
+
+{"text": "JMeter Test Report: <Jenkins-Report-URL>"}
+
+Outcome
+
+✔ Team automatically notified when test is completed
+✔ No need to manually check Jenkins
+
+⸻
+
+5. Why Deployment Check Needed (Major Fix)
+
+Originally, the pipeline would run JMeter test on every code commit, even when no new deployment was applied.
+
+Now the logic ensures:
+
+✔ Run only when a new deployment is applied
+
+✔ Avoid wasting time and server resources
+
+✔ Prevent overlapping JMeter load tests
+
+✔ Improve cluster safety & VM load management
+
+This logic is stored in:
+
+last_deploy_generation.txt
+
+
+⸻
+
+6. What Can Be Modified
+
+Teams receiving the handover can adjust:
+
+🔹 Change JMX file
+
+Update jmxName under the JMeter stage.
+
+🔹 Change Kubernetes deployment name
+
+Update:
+
+DEPLOYMENT
+APP_LABEL
+
+🔹 Change JMeter VM or Kubernetes VM
+
+Modify IPs/passwords in the environment block.
+
+🔹 Disable HTML serving
+
+Comment out the HTTP server stage if not needed.
+
+🔹 Add Grafana/Prometheus validation
+
+Integrate before JMeter run if needed.
+
+⸻
+
+7. Troubleshooting Guide
+
+🔸 Pipeline exits immediately
+
+Check:
+
+last_deploy_generation.txt
+kubectl get deployment ... -o=jsonpath
+
+🔸 JMeter report missing
+
+Verify:
+
+ls -l /home1/QK/MBR/HTML_Reports/<folder>
+
+🔸 Pods not moving to Ready
+
+Check:
+
+kubectl describe pod
+kubectl logs <pod>
+
+
+⸻
+
+8. Summary for Handover
+
+This pipeline automates the entire post-deployment performance testing workflow:
+
+Step	Responsibility
+Detect new deployment	Prevent unnecessary test runs
+Wait for pod readiness	Ensure app stability
+Run remote JMeter test	Validate performance impact
+Generate HTML reports	Easy analysis
+Publish + Archive	Historical tracking
+Teams alert	Quick communication
+
+This pipeline ensures end-to-end automation, minimizes manual intervention, and keeps performance testing consistent, repeatable, and deployment-aware.
+
+⸻
+
+If you’d like, I can also prepare:
+
+✅ A PDF-format handover document
+✅ A Confluence-style version
+✅ A sequence diagram explaining pipeline flow
+✅ A cleaned-up optimized Jenkinsfile
+
+Just tell me!
