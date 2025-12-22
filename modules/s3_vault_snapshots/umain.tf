@@ -1,3 +1,5 @@
+data "aws_caller_identity" "current" {}
+
 ############################################
 # S3 bucket
 ############################################
@@ -16,6 +18,7 @@ resource "aws_s3_bucket_public_access_block" "this" {
 
 resource "aws_s3_bucket_ownership_controls" "this" {
   bucket = aws_s3_bucket.this.id
+
   rule {
     object_ownership = "BucketOwnerEnforced"
   }
@@ -23,38 +26,63 @@ resource "aws_s3_bucket_ownership_controls" "this" {
 
 resource "aws_s3_bucket_versioning" "this" {
   bucket = aws_s3_bucket.this.id
+
   versioning_configuration {
     status = "Enabled"
   }
 }
 
 ############################################
-# KMS CMK for SSE-KMS (customer-managed)
+# Locals: KMS policy statements (SAFE)
+############################################
+locals {
+  kms_root_statement = {
+    Sid    = "EnableRootPermissions"
+    Effect = "Allow"
+    Principal = {
+      AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
+    }
+    Action   = "kms:*"
+    Resource = "*"
+  }
+
+  # Only included when vault_role_arn is non-empty
+  kms_vault_role_statement = var.vault_role_arn != "" ? {
+    Sid    = "AllowVaultRoleUseOfKey"
+    Effect = "Allow"
+    Principal = {
+      AWS = var.vault_role_arn
+    }
+    Action = [
+      "kms:Encrypt",
+      "kms:Decrypt",
+      "kms:ReEncrypt*",
+      "kms:GenerateDataKey*",
+      "kms:DescribeKey"
+    ]
+    Resource = "*"
+  } : null
+}
+
+############################################
+# KMS key (customer managed) + alias
 ############################################
 resource "aws_kms_key" "this" {
   description             = "CMK for Vault auto-snapshots bucket SSE-KMS"
   enable_key_rotation     = true
   deletion_window_in_days = 30
 
-  # Minimal key policy: allow account root full admin.
-  # (If your org uses an admin role, swap root for that role.)
+  # IMPORTANT: compact() removes null statement so KMS never sees invalid principal
   policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Sid      = "EnableRootPermissions"
-        Effect   = "Allow"
-        Principal = { AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root" }
-        Action   = "kms:*"
-        Resource = "*"
-      }
-    ]
+    Version   = "2012-10-17"
+    Statement = compact([
+      local.kms_root_statement,
+      local.kms_vault_role_statement
+    ])
   })
 
   tags = var.tags
 }
-
-data "aws_caller_identity" "current" {}
 
 resource "aws_kms_alias" "this" {
   name          = var.kms_key_alias != "" ? var.kms_key_alias : "alias/vault-auto-snapshots-${var.bucket_name}"
@@ -62,7 +90,7 @@ resource "aws_kms_alias" "this" {
 }
 
 ############################################
-# S3 default encryption: SSE-KMS using CMK
+# Default bucket encryption: SSE-KMS (CMK)
 ############################################
 resource "aws_s3_bucket_server_side_encryption_configuration" "this" {
   bucket = aws_s3_bucket.this.id
@@ -72,17 +100,15 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "this" {
       sse_algorithm     = "aws:kms"
       kms_master_key_id = aws_kms_key.this.arn
     }
-
-    # Optional but recommended: reduces KMS calls/cost
     bucket_key_enabled = true
   }
 }
 
 ############################################
-# Bucket policy
+# Bucket policy:
 # - Deny non-HTTPS
-# - Deny PUT without SSE-KMS + enforce our CMK
-# - Optional: allow Vault role (when provided)
+# - Enforce SSE-KMS + enforce THIS CMK
+# - Allow Vault role when provided
 ############################################
 locals {
   deny_insecure_transport = {
@@ -99,7 +125,6 @@ locals {
     }
   }
 
-  # Enforce SSE-KMS on object uploads
   deny_unencrypted_put = {
     Sid       = "DenyUnEncryptedObjectUploads"
     Effect    = "Deny"
@@ -113,7 +138,6 @@ locals {
     }
   }
 
-  # Enforce the specific CMK (prevents someone using aws managed key or another CMK)
   deny_wrong_kms_key = {
     Sid       = "DenyWrongKmsKey"
     Effect    = "Deny"
@@ -168,7 +192,5 @@ resource "aws_s3_bucket_policy" "this" {
   bucket = aws_s3_bucket.this.id
   policy = jsonencode(local.bucket_policy)
 
-  depends_on = [
-    aws_s3_bucket_server_side_encryption_configuration.this
-  ]
+  depends_on = [aws_s3_bucket_server_side_encryption_configuration.this]
 }
