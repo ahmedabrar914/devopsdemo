@@ -1,3 +1,6 @@
+############################################
+# Identity
+############################################
 data "aws_caller_identity" "current" {}
 
 ############################################
@@ -33,52 +36,51 @@ resource "aws_s3_bucket_versioning" "this" {
 }
 
 ############################################
-# Locals: KMS policy statements (SAFE)
-############################################
-locals {
-  kms_root_statement = {
-    Sid    = "EnableRootPermissions"
-    Effect = "Allow"
-    Principal = {
-      AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
-    }
-    Action   = "kms:*"
-    Resource = "*"
-  }
-
-  # Only included when vault_role_arn is non-empty
-  kms_vault_role_statement = var.vault_role_arn != "" ? {
-    Sid    = "AllowVaultRoleUseOfKey"
-    Effect = "Allow"
-    Principal = {
-      AWS = var.vault_role_arn
-    }
-    Action = [
-      "kms:Encrypt",
-      "kms:Decrypt",
-      "kms:ReEncrypt*",
-      "kms:GenerateDataKey*",
-      "kms:DescribeKey"
-    ]
-    Resource = "*"
-  } : null
-}
-
-############################################
 # KMS key (customer managed) + alias
 ############################################
+locals {
+  kms_root_statement = [
+    {
+      Sid    = "EnableRootPermissions"
+      Effect = "Allow"
+      Principal = {
+        AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
+      }
+      Action   = "kms:*"
+      Resource = "*"
+    }
+  ]
+
+  kms_vault_role_statement = var.vault_role_arn != "" ? [
+    {
+      Sid    = "AllowVaultRoleUseOfKey"
+      Effect = "Allow"
+      Principal = {
+        AWS = var.vault_role_arn
+      }
+      Action = [
+        "kms:Encrypt",
+        "kms:Decrypt",
+        "kms:ReEncrypt*",
+        "kms:GenerateDataKey*",
+        "kms:DescribeKey"
+      ]
+      Resource = "*"
+    }
+  ] : []
+}
+
 resource "aws_kms_key" "this" {
   description             = "CMK for Vault auto-snapshots bucket SSE-KMS"
   enable_key_rotation     = true
   deletion_window_in_days = 30
 
-  # IMPORTANT: compact() removes null statement so KMS never sees invalid principal
   policy = jsonencode({
     Version   = "2012-10-17"
-    Statement = compact([
+    Statement = concat(
       local.kms_root_statement,
       local.kms_vault_role_statement
-    ])
+    )
   })
 
   tags = var.tags
@@ -90,7 +92,7 @@ resource "aws_kms_alias" "this" {
 }
 
 ############################################
-# Default bucket encryption: SSE-KMS (CMK)
+# Default bucket encryption: SSE-KMS
 ############################################
 resource "aws_s3_bucket_server_side_encryption_configuration" "this" {
   bucket = aws_s3_bucket.this.id
@@ -105,10 +107,7 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "this" {
 }
 
 ############################################
-# Bucket policy:
-# - Deny non-HTTPS
-# - Enforce SSE-KMS + enforce THIS CMK
-# - Allow Vault role when provided
+# Bucket policy
 ############################################
 locals {
   deny_insecure_transport = {
@@ -121,7 +120,9 @@ locals {
       "${aws_s3_bucket.this.arn}/*"
     ]
     Condition = {
-      Bool = { "aws:SecureTransport" = "false" }
+      Bool = {
+        "aws:SecureTransport" = "false"
+      }
     }
   }
 
@@ -129,7 +130,7 @@ locals {
     Sid       = "DenyUnEncryptedObjectUploads"
     Effect    = "Deny"
     Principal = "*"
-    Action    = ["s3:PutObject"]
+    Action    = "s3:PutObject"
     Resource  = "${aws_s3_bucket.this.arn}/*"
     Condition = {
       StringNotEquals = {
@@ -142,7 +143,7 @@ locals {
     Sid       = "DenyWrongKmsKey"
     Effect    = "Deny"
     Principal = "*"
-    Action    = ["s3:PutObject"]
+    Action    = "s3:PutObject"
     Resource  = "${aws_s3_bucket.this.arn}/*"
     Condition = {
       StringNotEquals = {
@@ -192,5 +193,7 @@ resource "aws_s3_bucket_policy" "this" {
   bucket = aws_s3_bucket.this.id
   policy = jsonencode(local.bucket_policy)
 
-  depends_on = [aws_s3_bucket_server_side_encryption_configuration.this]
+  depends_on = [
+    aws_s3_bucket_server_side_encryption_configuration.this
+  ]
 }
