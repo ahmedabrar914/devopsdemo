@@ -1,0 +1,12 @@
+cat > /tmp/raft-s3-snapshot.json <<'EOF'
+{
+  "interval": "5m",
+  "retain": 10,
+  "storage_type": "aws-s3",
+  "aws_s3_bucket": "vaas-test-zs-123",
+  "aws_s3_region": "us-west-2",
+  "path_prefix": "vault-raft-snapshots",
+  "file_prefix": "raft-snapshot",
+  "aws_s3_server_side_encryption": true
+}
+EOF
