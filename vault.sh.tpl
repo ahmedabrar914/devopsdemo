@@ -75,3 +75,8 @@ function restart_zotelagent {
 
   log "INFO" "Restarting zotelagent"
   restart_zotelagent
+
+audit {
+  file_path = "/var/log/vault/vault-audit.log"
+  log_raw   = false
+}
