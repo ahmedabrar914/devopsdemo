@@ -1,0 +1,340 @@
+Below is a full, end-to-end runbook, written deliberately in a “read-like-a-book” style.
+You can copy this directly into Confluence / Word / Markdown with minimal edits.
+
+⸻
+
+Vault Raft Snapshots to S3 – Configuration & Operations Runbook
+
+⸻
+
+1. Purpose of This Runbook
+
+This document explains why, how, and when Vault snapshots are configured, stored, and used.
+
+By the end of this runbook, a reader should understand:
+	•	What Vault snapshots are and why they matter
+	•	How automated snapshots to Amazon S3 are configured
+	•	How security and immutability are enforced
+	•	How to take manual snapshots
+	•	How to verify, restore, and troubleshoot snapshots
+
+This runbook assumes:
+	•	Vault is deployed on EC2
+	•	Vault uses Raft integrated storage
+	•	Snapshots are stored in Amazon S3
+	•	Security best practices (SSE-KMS, private bucket, TLS, Object Lock) are followed
+
+⸻
+
+2. What Is a Vault Snapshot?
+
+A Vault snapshot is a point-in-time, consistent backup of Vault’s internal Raft storage.
+
+It contains:
+	•	All secrets
+	•	All auth methods
+	•	All policies
+	•	All namespaces
+	•	All internal metadata
+
+A snapshot is not a filesystem backup.
+It is a logical backup of Vault’s state, safe to restore across nodes.
+
+⸻
+
+3. Why Snapshots Are Required
+
+Snapshots protect Vault against:
+	•	Accidental secret deletion
+	•	Namespace corruption
+	•	Failed upgrades
+	•	Node loss across Availability Zones
+	•	Operator error
+	•	Disaster recovery scenarios
+
+Without snapshots:
+	•	Raft data loss = total Vault data loss
+	•	Recovery is not possible
+
+Snapshots are the only supported recovery mechanism for Raft.
+
+⸻
+
+4. Snapshot Strategy Used
+
+Snapshot Type
+	•	Raft integrated storage snapshots
+
+Storage Location
+	•	Amazon S3 (private bucket)
+
+Frequency
+	•	Every 1 hour
+
+Retention
+	•	13 months
+
+Security Controls
+	•	Private bucket
+	•	Block public access
+	•	Versioning enabled
+	•	SSE-KMS with customer-managed key
+	•	Object Lock enabled (Governance or Compliance)
+	•	TLS enforced
+
+⸻
+
+5. High-Level Architecture
+
+Vault (EC2, Raft)
+   |
+   |  (HTTPS + IAM role)
+   v
+Amazon S3 (Private, Versioned, SSE-KMS, Object Lock)
+
+Vault writes snapshots directly to S3 using:
+	•	AWS SDK
+	•	IAM role attached to Vault EC2 instances
+
+⸻
+
+6. Prerequisites Before Configuration
+
+Before configuring snapshots, ensure the following exist:
+
+6.1 S3 Bucket
+	•	Bucket created
+	•	Versioning enabled
+	•	Public access blocked
+	•	Object Lock enabled
+	•	SSE-KMS enabled
+
+6.2 KMS Key
+	•	Customer-managed CMK
+	•	Key rotation enabled
+	•	Vault IAM role allowed to use the key
+
+6.3 IAM Role for Vault
+
+Vault EC2 role must allow:
+	•	s3:PutObject
+	•	s3:GetObject
+	•	s3:DeleteObject
+	•	s3:ListBucket
+	•	kms:Encrypt
+	•	kms:Decrypt
+	•	kms:GenerateDataKey
+
+⸻
+
+7. Configuring Automated Snapshots in Vault
+
+Snapshots are configured inside Vault, not in Terraform.
+
+Terraform only prepares:
+	•	S3
+	•	KMS
+	•	IAM
+
+7.1 Login to Vault
+
+vault login <token>
+
+Must be:
+	•	Root token or
+	•	Token with sudo capability on sys/storage
+
+⸻
+
+7.2 Configure Auto Snapshot (S3)
+
+vault write sys/storage/raft/snapshot-auto/config/snapshots \
+  interval="1h" \
+  retain=9360 \
+  storage_type="aws-s3" \
+  aws_s3_bucket="vault-snapshots-prod" \
+  aws_s3_region="us-west-2" \
+  path_prefix="raft-auto" \
+  file_prefix="vault-snapshot" \
+  aws_s3_enable_kms=true
+
+
+⸻
+
+7.3 Parameter Explanation
+
+Parameter	Meaning
+interval	Snapshot frequency
+retain	Number of snapshots to keep
+storage_type	Backend type
+aws_s3_bucket	Target bucket
+path_prefix	Folder-like prefix in S3
+file_prefix	Snapshot file name prefix
+aws_s3_enable_kms	Enables SSE-KMS
+
+Retention calculation
+
+1 snapshot/hour
+24 per day
+30 days ≈ 720
+13 months ≈ 9360
+
+
+⸻
+
+8. Verifying Auto Snapshot Configuration
+
+8.1 Read Configuration
+
+vault read sys/storage/raft/snapshot-auto/config/snapshots
+
+Expected output:
+	•	Interval = 1h
+	•	Retain = 9360
+	•	Storage = aws-s3
+
+⸻
+
+8.2 Verify Snapshots in S3
+	•	Open S3 bucket
+	•	Enable Show versions
+	•	Look under raft-auto/
+
+You should see:
+
+vault-snapshot-2025-01-18T10-00.snap
+vault-snapshot-2025-01-18T11-00.snap
+
+
+⸻
+
+9. Taking Manual Snapshots
+
+Manual snapshots are used when:
+	•	Before upgrades
+	•	Before major config changes
+	•	Before namespace deletion
+	•	During incident response
+
+⸻
+
+9.1 Manual Snapshot to Local Disk
+
+vault operator raft snapshot save vault-manual.snap
+
+This creates a local snapshot file.
+
+⸻
+
+9.2 Upload Manual Snapshot to S3
+
+aws s3 cp vault-manual.snap \
+  s3://vault-snapshots-prod/raft-manual/vault-manual-2025-01-18.snap
+
+This keeps manual snapshots separate from automated ones.
+
+⸻
+
+9.3 Manual Snapshot Directly to S3 (Optional)
+
+Vault does not natively push manual snapshots to S3.
+The recommended approach is:
+	1.	Save locally
+	2.	Upload using AWS CLI
+
+This gives operator control and auditability.
+
+⸻
+
+10. Understanding Object Lock Behavior
+
+10.1 Why Snapshots Can “Disappear”
+
+With:
+	•	Versioning enabled
+	•	Object Lock enabled
+
+Deleting an object:
+	•	Adds a delete marker
+	•	Does not delete retained versions
+
+This is expected behavior.
+
+⸻
+
+10.2 How to Check Delete Markers
+
+In S3:
+	1.	Open bucket
+	2.	Enable Show versions
+	3.	Look for:
+	•	Delete marker (0 B)
+	•	Older retained versions
+
+⸻
+
+11. Restoring from a Snapshot (Disaster Recovery)
+
+11.1 Stop Vault
+
+systemctl stop vault
+
+
+⸻
+
+11.2 Restore Snapshot
+
+vault operator raft snapshot restore vault-snapshot.snap
+
+⚠️ This replaces all Vault data.
+
+⸻
+
+11.3 Start Vault
+
+systemctl start vault
+
+Vault will restart with the restored state.
+
+⸻
+
+12. Operational Best Practices
+	•	Always verify snapshots after configuration
+	•	Keep auto and manual snapshots in separate prefixes
+	•	Use Object Lock Governance or Compliance
+	•	Monitor snapshot creation via logs
+	•	Test restore procedure quarterly
+	•	Never disable snapshots in production
+
+⸻
+
+13. Common Failure Scenarios
+
+Issue	Cause
+Snapshots missing	Auto snapshot not configured
+Snapshot deleted	Delete marker applied
+KMS error	IAM role missing permissions
+Restore fails	Vault not stopped
+
+
+⸻
+
+14. Final Summary
+
+Vault snapshots are:
+	•	The last line of defense
+	•	Mandatory for Raft
+	•	Simple to configure
+	•	Critical to operate correctly
+
+A Vault deployment without snapshots is incomplete.
+
+⸻
+
+If you want, next I can:
+	•	Convert this into Confluence-ready markdown
+	•	Add architecture diagrams
+	•	Add incident recovery scenarios
+	•	Add audit/compliance mapping
+
+Just tell me.
