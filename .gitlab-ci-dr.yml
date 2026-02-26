@@ -82,25 +82,21 @@ default:
       echo "Sending SSM command to bastion ${BASTION_INSTANCE_ID} in ${TARGET_REGION}"
 
       # Remote script executed ON BASTION
-      REMOTE_SCRIPT="$(cat <<'EOF'
+      read -r -d '' REMOTE_SCRIPT <<'EOF'
       set -euo pipefail
-
+      
       VAULT_SSH_USER="__VAULT_SSH_USER__"
       VAULT_ADDR_LOCAL="__VAULT_ADDR_LOCAL__"
       VAULT_NODES="__VAULT_NODES__"
       SSH_KEY_PATH="__SSH_KEY_PATH__"
-
-      # Dedicated known_hosts file to avoid /root/.ssh/known_hosts pollution
+      
       KNOWN_HOSTS_FILE="/tmp/known_hosts_vault"
-
       read -r -a NODES <<< "${VAULT_NODES}"
-
+      
       ssh_vault() {
         local host="$1"; shift
-
-        # Handle: "REMOTE HOST IDENTIFICATION HAS CHANGED!"
         ssh-keygen -f "${KNOWN_HOSTS_FILE}" -R "${host}" >/dev/null 2>&1 || true
-
+      
         ssh -i "${SSH_KEY_PATH}" \
           -o UserKnownHostsFile="${KNOWN_HOSTS_FILE}" \
           -o StrictHostKeyChecking=accept-new \
@@ -108,10 +104,9 @@ default:
           "${VAULT_SSH_USER}@${host}" \
           "bash -lc $'set -euo pipefail\n$*'"
       }
-
+    
       find_leader() {
         for n in "${NODES[@]}"; do
-          # vault status doesn't require token
           standby="$(ssh_vault "$n" "export VAULT_ADDR='${VAULT_ADDR_LOCAL}'; vault status -format=json | jq -r .standby" || true)"
           if [[ "$standby" == "false" ]]; then
             echo "$n"
@@ -120,17 +115,18 @@ default:
         done
         return 1
       }
-
+  
       leader="$(find_leader || true)"
       if [[ -z "${leader:-}" ]]; then
         echo "ERROR: Could not find leader. Nodes=${VAULT_NODES}" >&2
         exit 1
       fi
-
+      
       echo "Leader: ${leader}"
       ssh_vault "$leader" "export VAULT_ADDR='${VAULT_ADDR_LOCAL}'; vault status -format=json | jq ."
       EOF
-      )"
+      
+
 
       # Substitute placeholders
       REMOTE_SCRIPT="${REMOTE_SCRIPT//__VAULT_SSH_USER__/${VAULT_SSH_USER}}"
