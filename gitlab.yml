@@ -10,12 +10,10 @@ stages:
 
 variables:
   STAGE_ROLE_ARN: "arn:aws:iam::792014834907:role/gitlab-vaas-iac-role"
-
   AWS_REGION: "us-west-2"
   BASTION_INSTANCE_ID: "i-035c86b6405b6ab1b"
   VAULT_NODE_IP: "10.82.0.111"
   SSH_KEY_PATH_ON_BASTION: "/usr/bin/vaas-staging/vault-staging-ssh-key.pem"
-
   VAULT_ADDR_LOCAL: "https://127.0.0.1:8200"
   VAULT_CACERT_PATH: "/etc/vault.d/tls/ca.pem"
 
@@ -25,11 +23,10 @@ vault-status-staging:
   id_tokens:
     GITLAB_OIDC_TOKEN:
       aud: https://gitlab.corp.zscaler.com
-  before_script:
-    - set -euo pipefail
-    - yum -y install jq >/dev/null 2>&1 || true
   script:
-    # Assume staging role using GitLab OIDC
+    - set -euo pipefail
+
+    # Assume role
     - |
       aws_sts_output=$(aws sts assume-role-with-web-identity \
         --role-arn "${STAGE_ROLE_ARN}" \
@@ -45,7 +42,7 @@ vault-status-staging:
 
       aws sts get-caller-identity
 
-    # Build REMOTE_CMD (SSM -> bastion -> ssh -> sudo -> export -> vault status)
+    # Build command (same logic as your local success)
     - |
       REMOTE_CMD="sudo -i bash -lc 'ssh -i ${SSH_KEY_PATH_ON_BASTION} \
         -o StrictHostKeyChecking=no \
@@ -55,22 +52,21 @@ vault-status-staging:
 
       echo "REMOTE_CMD=${REMOTE_CMD}"
 
-    # Create valid JSON input for send-command (NO quoting issues)
+    # Escape for JSON safely using python (available on many runners; if not, tell me)
     - |
-      jq -n \
-        --arg region "${AWS_REGION}" \
-        --arg iid "${BASTION_INSTANCE_ID}" \
-        --arg doc "AWS-RunShellScript" \
-        --arg cmd "${REMOTE_CMD}" \
-        '{
-          DocumentName: $doc,
-          InstanceIds: [$iid],
-          Parameters: { commands: [$cmd] }
-        }' > ssm-input.json
+      python3 - <<'PY' > ssm-input.json
+import json, os
+payload = {
+  "DocumentName": "AWS-RunShellScript",
+  "InstanceIds": [os.environ["BASTION_INSTANCE_ID"]],
+  "Parameters": {"commands": [os.environ["REMOTE_CMD"]]},
+}
+print(json.dumps(payload))
+PY
 
       cat ssm-input.json
 
-    # Send SSM command using cli-input-json
+    # Send + print output
     - |
       CMD_ID=$(aws ssm send-command \
         --region "${AWS_REGION}" \
