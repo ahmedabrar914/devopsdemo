@@ -6,7 +6,6 @@ workflow:
 
 stages: [status]
 
-# Reuse your existing assume role pattern (update role ARN if needed)
 variables:
   STAGE_ROLE_ARN: arn:aws:iam::792014834907:role/gitlab-vaas-iac-role
 
@@ -41,6 +40,8 @@ default:
       : "${VAULT_NODES:?missing VAULT_NODES}"
       : "${VAULT_SSH_USER:?missing VAULT_SSH_USER}"
       : "${VAULT_ADDR_LOCAL:?missing VAULT_ADDR_LOCAL}"
+      : "${SSH_KEY_PATH:?missing SSH_KEY_PATH}"
+      : "${SSH_WORKDIR:?missing SSH_WORKDIR}"
 
       REMOTE_SCRIPT="$(cat <<'EOF'
       set -euo pipefail
@@ -48,12 +49,19 @@ default:
       VAULT_SSH_USER="__VAULT_SSH_USER__"
       VAULT_ADDR_LOCAL="__VAULT_ADDR_LOCAL__"
       VAULT_NODES="__VAULT_NODES__"
+      SSH_KEY_PATH="__SSH_KEY_PATH__"
+      SSH_WORKDIR="__SSH_WORKDIR__"
+
+      # mimic your manual steps: sudo su + cd
+      cd "${SSH_WORKDIR}"
 
       read -r -a NODES <<< "${VAULT_NODES}"
 
       ssh_vault() {
         local host="$1"; shift
-        ssh -o StrictHostKeyChecking=accept-new "${VAULT_SSH_USER}@${host}" "bash -lc $'set -euo pipefail\n$*'"
+        ssh -i "${SSH_KEY_PATH}" -o StrictHostKeyChecking=accept-new \
+          "${VAULT_SSH_USER}@${host}" \
+          "bash -lc $'set -euo pipefail\n$*'"
       }
 
       find_leader() {
@@ -78,6 +86,8 @@ default:
       REMOTE_SCRIPT="${REMOTE_SCRIPT//__VAULT_SSH_USER__/${VAULT_SSH_USER}}"
       REMOTE_SCRIPT="${REMOTE_SCRIPT//__VAULT_ADDR_LOCAL__/${VAULT_ADDR_LOCAL}}"
       REMOTE_SCRIPT="${REMOTE_SCRIPT//__VAULT_NODES__/${VAULT_NODES}}"
+      REMOTE_SCRIPT="${REMOTE_SCRIPT//__SSH_KEY_PATH__/${SSH_KEY_PATH}}"
+      REMOTE_SCRIPT="${REMOTE_SCRIPT//__SSH_WORKDIR__/${SSH_WORKDIR}}"
 
       CMD_B64="$(printf "%s" "${REMOTE_SCRIPT}" | base64 -w0)"
 
@@ -111,22 +121,26 @@ default:
         esac
       done
 
+status-use1:
+  stage: status
+  extends: .ssm_status
+  variables:
+    TARGET_REGION: "us-east-1"
+    BASTION_INSTANCE_ID: "i-076259481ae826b71"     # from your screenshot
+    VAULT_SSH_USER: "ubuntu"                      # matches your ssh command
+    SSH_WORKDIR: "/root/vaas-dev-dr"              # because you sudo su
+    SSH_KEY_PATH: "/root/vaas-dev-dr/vault-dev-dr-ssh-key.pem"
+    VAULT_ADDR_LOCAL: "https://127.0.0.1:8200"
+    VAULT_NODES: "10.75.0.187 10.75.0.188 10.75.0.189"
+
 status-usw2:
   stage: status
   extends: .ssm_status
   variables:
     TARGET_REGION: "us-west-2"
     BASTION_INSTANCE_ID: "i-REPLACE_WITH_USW2_BASTION_ID"
-    VAULT_SSH_USER: "ec2-user"
+    VAULT_SSH_USER: "ubuntu"
+    SSH_WORKDIR: "/root/vaas-dev"                 # adjust if your usw2 folder differs
+    SSH_KEY_PATH: "/root/vaas-dev/vault-dev-ssh-key.pem"
     VAULT_ADDR_LOCAL: "https://127.0.0.1:8200"
-    VAULT_NODES: "10.0.10.11 10.0.11.12 10.0.12.13"
-
-status-use1:
-  stage: status
-  extends: .ssm_status
-  variables:
-    TARGET_REGION: "us-east-1"
-    BASTION_INSTANCE_ID: "i-REPLACE_WITH_USE1_BASTION_ID"
-    VAULT_SSH_USER: "ec2-user"
-    VAULT_ADDR_LOCAL: "https://127.0.0.1:8200"
-    VAULT_NODES: "10.1.10.11 10.1.11.12 10.1.12.13"
+    VAULT_NODES: "10.x.x.x 10.x.x.x 10.x.x.x"
