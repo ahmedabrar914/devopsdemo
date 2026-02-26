@@ -52,65 +52,86 @@ vault_status_staging:
     - aws sts get-caller-identity
 
   script:
-    - set -euo pipefail
+  - set -euo pipefail
 
-    # Build the command that will run ON BASTION via SSM
-    - |
-      REMOTE_CMD="sudo -i bash -lc 'ssh -i ${SSH_KEY_PATH_ON_BASTION} \
-        -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        ubuntu@${VAULT_NODE_IP} \
-        \"sudo -i bash -lc \\\"export VAULT_ADDR=${VAULT_ADDR_LOCAL}; export VAULT_CACERT=${VAULT_CACERT_PATH}; vault status\\\"\"'"
+  # Assume role
+  - |
+    aws_sts_output="$(aws sts assume-role-with-web-identity \
+      --role-arn "${STAGE_ROLE_ARN}" \
+      --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}" \
+      --web-identity-token "${GITLAB_OIDC_TOKEN}" \
+      --duration-seconds 3600 \
+      --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+      --output text)"
 
-      echo "=== Remote command to execute on bastion (sanitized view) ==="
-      echo "${REMOTE_CMD}" | sed 's|-i [^ ]*|-i <KEY_PATH>|g'
+    export AWS_ACCESS_KEY_ID="$(echo "$aws_sts_output" | awk '{print $1}')"
+    export AWS_SECRET_ACCESS_KEY="$(echo "$aws_sts_output" | awk '{print $2}')"
+    export AWS_SESSION_TOKEN="$(echo "$aws_sts_output" | awk '{print $3}')"
 
-    # Send command to bastion
-    - |
-      CMD_ID="$(aws ssm send-command \
-        --region "${AWS_REGION}" \
-        --instance-ids "${BASTION_INSTANCE_ID}" \
-        --document-name "AWS-RunShellScript" \
-        --comment "Vault status via bastion->vaultnode" \
-        --parameters "commands=${REMOTE_CMD}" \
-        --query "Command.CommandId" \
-        --output text)"
+    aws sts get-caller-identity
 
-      echo "SSM CommandId: ${CMD_ID}"
+  # Build script that will run ON BASTION
+  - |
+    cat > vault_status.sh <<EOF
+#!/bin/bash
+set -euo pipefail
 
-    # IMPORTANT: don't exit early if waiter fails; always print stdout/stderr
-    - |
-      set +e
-      aws ssm wait command-executed \
-        --region "${AWS_REGION}" \
-        --command-id "${CMD_ID}" \
-        --instance-id "${BASTION_INSTANCE_ID}"
-      WAIT_RC=$?
-      set -e
+sudo -i bash -lc "ssh -i ${SSH_KEY_PATH_ON_BASTION} \
+  -o StrictHostKeyChecking=no \
+  -o UserKnownHostsFile=/dev/null \
+  ubuntu@${VAULT_NODE_IP} \
+  \"sudo -i bash -lc 'export VAULT_ADDR=${VAULT_ADDR_LOCAL}; export VAULT_CACERT=${VAULT_CACERT_PATH}; vault status'\""
+EOF
 
-      echo "==== SSM STDOUT ===="
-      aws ssm get-command-invocation \
-        --region "${AWS_REGION}" \
-        --command-id "${CMD_ID}" \
-        --instance-id "${BASTION_INSTANCE_ID}" \
-        --query "StandardOutputContent" \
-        --output text || true
+    chmod +x vault_status.sh
 
-      echo "==== SSM STDERR ===="
-      aws ssm get-command-invocation \
-        --region "${AWS_REGION}" \
-        --command-id "${CMD_ID}" \
-        --instance-id "${BASTION_INSTANCE_ID}" \
-        --query "StandardErrorContent" \
-        --output text || true
+    echo "=== Script to run on bastion ==="
+    cat vault_status.sh
 
-      # Also show final status fields for debugging
-      echo "==== SSM STATUS SUMMARY ===="
-      aws ssm get-command-invocation \
-        --region "${AWS_REGION}" \
-        --command-id "${CMD_ID}" \
-        --instance-id "${BASTION_INSTANCE_ID}" \
-        --query "{Status:Status,StatusDetails:StatusDetails,ResponseCode:ResponseCode}" \
-        --output json || true
+    # Base64 encode it
+    B64_SCRIPT=$(base64 vault_status.sh | tr -d '\n')
 
-      exit $WAIT_RC
+  # Send to SSM safely
+  - |
+    CMD_ID=$(aws ssm send-command \
+      --region "${AWS_REGION}" \
+      --instance-ids "${BASTION_INSTANCE_ID}" \
+      --document-name "AWS-RunShellScript" \
+      --parameters "commands=[
+        \"echo ${B64_SCRIPT} | base64 -d > /tmp/vault_status.sh\",
+        \"chmod +x /tmp/vault_status.sh\",
+        \"bash /tmp/vault_status.sh\"
+      ]" \
+      --query "Command.CommandId" \
+      --output text)
+
+    echo "SSM CommandId: ${CMD_ID}"
+
+  # Wait + print output (even if fails)
+  - |
+    set +e
+    aws ssm wait command-executed \
+      --region "${AWS_REGION}" \
+      --command-id "${CMD_ID}" \
+      --instance-id "${BASTION_INSTANCE_ID}"
+    WAIT_RC=$?
+    set -e
+
+    echo "==== STDOUT ===="
+    aws ssm get-command-invocation \
+      --region "${AWS_REGION}" \
+      --command-id "${CMD_ID}" \
+      --instance-id "${BASTION_INSTANCE_ID}" \
+      --query "StandardOutputContent" \
+      --output text || true
+
+    echo "==== STDERR ===="
+    aws ssm get-command-invocation \
+      --region "${AWS_REGION}" \
+      --command-id "${CMD_ID}" \
+      --instance-id "${BASTION_INSTANCE_ID}" \
+      --query "StandardErrorContent" \
+      --output text || true
+
+    exit $WAIT_RC
+      
