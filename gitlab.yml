@@ -1,79 +1,120 @@
 workflow:
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-    - if: '$CI_COMMIT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "api"'
+    - if: '$CI_PIPELINE_SOURCE == "pipeline"'
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+    - when: never
 
 stages:
-  - vault_status
+  - status
 
-vault-status-primary:
-  stage: vault_status
+variables:
+  STAGE_ROLE_ARN: "arn:aws:iam::792014834907:role/gitlab-vaas-iac-role"
+  KUBERNETES_POD_LABELS_INTERNET_ALLOW: "internet=allow"
+
+vault-leader-status:
+  stage: status
   image: amazon/aws-cli:2.15.57
-  tags:
-    - sqrunners-k8s
-  variables:
-    KUBERNETES_POD_LABELS_INTERNET_ALLOW: "internet-allow"
+
+  parallel:
+    matrix:
+      - TARGET: "PRIMARY"
+        AWS_REGION: "us-west-2"
+        VAULT_TAG_NAME: "vaas-staging"
+        BASTION_INSTANCE_ID: "i-PRIMARY_BASTION_ID"
+        SSH_KEY_PATH_ON_BASTION: "/usr/bin/vaas-staging/vault-staging-ssh-key.pem"
+        SSH_USER: "ubuntu"
+        VAULT_ADDR_LOCAL: "https://127.0.0.1:8200"
+        VAULT_CACERT_PATH: "/etc/vault.d/tls/ca.pem"
+
+      - TARGET: "DR"
+        AWS_REGION: "us-east-1"
+        VAULT_TAG_NAME: "vaas-dev-dr"
+        BASTION_INSTANCE_ID: "i-DR_BASTION_ID"
+        SSH_KEY_PATH_ON_BASTION: "/usr/bin/vaas-staging/vault-staging-ssh-key.pem"
+        SSH_USER: "ubuntu"
+        VAULT_ADDR_LOCAL: "https://127.0.0.1:8200"
+        VAULT_CACERT_PATH: "/etc/vault.d/tls/ca.pem"
+
   id_tokens:
     GITLAB_OIDC_TOKEN:
-      aud: "https://gitlab.corp.zscaler.com"
-  script:
+      aud: https://gitlab.corp.zscaler.com
+
+  before_script:
     - set -euo pipefail
-
-    # --------- FIXES for your runner ----------
-    - yum -y install jq openssh-clients coreutils perl >/dev/null 2>&1 || true
+    - yum -y install bash coreutils jq >/dev/null 2>&1 || true
     - aws --version
-    - jq --version || true
 
-    # --------- PRIMARY CONFIG (kept in job only) ----------
-    - PRIMARY_REGION="us-west-2"
-    - PRIMARY_BASTION_INSTANCE_ID="i-035c86b6405b6ab1b"
-    - PRIMARY_VAULT_TAG_NAME="vaas-staging"
-    - PRIMARY_SSH_KEY_PATH_ON_BASTION="/usr/bin/vaas-staging/vault-staging-ssh-key.pem"
-    - PRIMARY_VAULT_SSH_USER="ubuntu"
-    - VAULT_ADDR_LOCAL="https://127.0.0.1:8200"
-    - VAULT_CACERT_PATH="/etc/vault.d/tls/ca.pem"
-    - STAGE_ROLE_ARN="arn:aws:iam::792014834907:role/gitlab-vaas-iac-role"
-
-    # --------- Assume role (OIDC) ----------
-    - echo "=== [PRIMARY] Assume role via OIDC ==="
+  script:
+    # 1) Assume AWS role via OIDC
     - |
+      echo "=== [$TARGET] Assuming role via OIDC ==="
       aws_sts_output="$(aws sts assume-role-with-web-identity \
         --role-arn "${STAGE_ROLE_ARN}" \
-        --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}-PRIMARY" \
+        --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}-${TARGET}" \
         --web-identity-token "${GITLAB_OIDC_TOKEN}" \
-        --duration-seconds 3600)"
-      export AWS_ACCESS_KEY_ID="$(echo "$aws_sts_output" | jq -r '.Credentials.AccessKeyId')"
-      export AWS_SECRET_ACCESS_KEY="$(echo "$aws_sts_output" | jq -r '.Credentials.SecretAccessKey')"
-      export AWS_SESSION_TOKEN="$(echo "$aws_sts_output" | jq -r '.Credentials.SessionToken')"
-    - aws sts get-caller-identity
-
-    # --------- Find all vault node private IPs ----------
-    - echo "=== [PRIMARY] Discovering Vault nodes by tag Name=${PRIMARY_VAULT_TAG_NAME} in ${PRIMARY_REGION} ==="
-    - |
-      PRIMARY_NODE_IPS="$(aws ec2 describe-instances \
-        --region "${PRIMARY_REGION}" \
-        --filters "Name=tag:Name,Values=${PRIMARY_VAULT_TAG_NAME}" "Name=instance-state-name,Values=running" \
-        --query "Reservations[].Instances[].PrivateIpAddress" \
+        --duration-seconds 3600 \
+        --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
         --output text)"
-      echo "Found node IPs: ${PRIMARY_NODE_IPS}"
-      [ -n "${PRIMARY_NODE_IPS}" ]
 
-    # --------- Build bastion script (leader detection + status) ----------
-    - echo "=== [PRIMARY] Build script to run on bastion ==="
+      export AWS_ACCESS_KEY_ID="$(echo "$aws_sts_output" | awk '{print $1}')"
+      export AWS_SECRET_ACCESS_KEY="$(echo "$aws_sts_output" | awk '{print $2}')"
+      export AWS_SESSION_TOKEN="$(echo "$aws_sts_output" | awk '{print $3}')"
+
+      aws sts get-caller-identity
+
+    # 2) Discover all Vault node private IPs by tag (expect 6)
     - |
-      cat > run_on_bastion_primary.sh <<'EOS'
+      echo "=== [$TARGET] Discovering Vault instances (Name=${VAULT_TAG_NAME}) in ${AWS_REGION} ==="
+      VAULT_NODE_IPS="$(
+        aws ec2 describe-instances \
+          --region "${AWS_REGION}" \
+          --filters \
+            "Name=tag:Name,Values=${VAULT_TAG_NAME}" \
+            "Name=instance-state-name,Values=running" \
+          --query 'Reservations[].Instances[].PrivateIpAddress' \
+          --output text | tr '\t' '\n'
+      )"
+
+      if [ -z "${VAULT_NODE_IPS}" ]; then
+        echo "ERROR: No running instances found for tag Name=${VAULT_TAG_NAME} in ${AWS_REGION}"
+        exit 1
+      fi
+
+      echo "Discovered node IPs:"
+      echo "${VAULT_NODE_IPS}"
+
+      # Make a single-line, space-separated list to embed safely
+      VAULT_NODE_IPS_ONE_LINE="$(echo "${VAULT_NODE_IPS}" | tr '\n' ' ' | xargs)"
+      export VAULT_NODE_IPS_ONE_LINE
+
+    # 3) Build script to run ON THE BASTION:
+    #    - loops through 6 nodes
+    #    - runs `vault status`
+    #    - detects leader by "HA Mode.*active"
+    #    - prints leader status and exits 0
+    #    - if none active, prints all statuses summary and exits 2
+    - |
+      echo "=== [$TARGET] Building bastion leader-check script ==="
+      cat > vault_leader_status.sh <<'EOF'
+      #!/bin/bash
       set -euo pipefail
 
-      VAULT_NODE_IPS="__VAULT_NODE_IPS__"
-      SSH_KEY="__SSH_KEY__"
-      SSH_USER="__SSH_USER__"
-      VAULT_ADDR_LOCAL="__VAULT_ADDR_LOCAL__"
-      VAULT_CACERT_PATH="__VAULT_CACERT_PATH__"
+      echo "Running on bastion: $(hostname)"
+      echo "Candidate Vault nodes: ${VAULT_NODE_IPS_ONE_LINE}"
+
+      is_active() {
+        # return 0 if active leader, else 1
+        # Works for typical `vault status` output where HA Mode is "active"/"standby"
+        grep -Eiq '^HA Mode\s*:\s*active\b' || grep -Eiq '^HA Mode\s+active\b'
+      }
 
       run_status() {
         local ip="$1"
-        sudo -i bash -lc "ssh -i '${SSH_KEY}' \
+
+        # Run vault status on the vault node (no token needed)
+        sudo -i bash -lc "ssh -i ${SSH_KEY_PATH_ON_BASTION} \
           -o StrictHostKeyChecking=no \
           -o UserKnownHostsFile=/dev/null \
           ${SSH_USER}@${ip} \
@@ -81,174 +122,102 @@ vault-status-primary:
       }
 
       LEADER_IP=""
-      for ip in ${VAULT_NODE_IPS}; do
-        OUT="$(run_status "${ip}" 2>&1 || true)"
-        if echo "${OUT}" | grep -qiE '^HA Mode[[:space:]]+active$'; then
+      LEADER_OUT=""
+
+      echo "---- Probing nodes for leader ----"
+      for ip in ${VAULT_NODE_IPS_ONE_LINE}; do
+        echo ""
+        echo "### Checking ${ip} ..."
+        set +e
+        out="$(run_status "${ip}" 2>&1)"
+        rc=$?
+        set -e
+
+        if [ $rc -ne 0 ]; then
+          echo "WARN: vault status failed on ${ip} (rc=${rc})"
+          echo "${out}"
+          continue
+        fi
+
+        # Print short info line always
+        ha_mode="$(echo "${out}" | awk -F: '/^HA Mode/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}')"
+        active_addr="$(echo "${out}" | awk -F: '/^Active Node Address/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}')"
+        echo "HA Mode=${ha_mode:-unknown} ActiveNode=${active_addr:-n/a}"
+
+        if echo "${out}" | is_active; then
           LEADER_IP="${ip}"
+          LEADER_OUT="${out}"
           break
         fi
       done
 
-      if [ -z "${LEADER_IP}" ]; then
-        echo "ERROR: Leader not found (no node returned HA Mode active)"
-        exit 2
+      echo ""
+      echo "==== RESULT ===="
+      if [ -n "${LEADER_IP}" ]; then
+        echo "Leader (active) node: ${LEADER_IP}"
+        echo "---- vault status (leader) ----"
+        echo "${LEADER_OUT}"
+        exit 0
       fi
 
-      echo "=== PRIMARY LEADER: ${LEADER_IP} ==="
-      run_status "${LEADER_IP}"
-EOS
+      echo "ERROR: No active leader found in node list."
+      echo "Tip: If cluster is down or sealed, `vault status` will not show HA Mode active."
+      exit 2
+      EOF
 
-      perl -0777 -i -pe "s|__VAULT_NODE_IPS__|${PRIMARY_NODE_IPS}|g;
-                         s|__SSH_KEY__|${PRIMARY_SSH_KEY_PATH_ON_BASTION}|g;
-                         s|__SSH_USER__|${PRIMARY_VAULT_SSH_USER}|g;
-                         s|__VAULT_ADDR_LOCAL__|${VAULT_ADDR_LOCAL}|g;
-                         s|__VAULT_CACERT_PATH__|${VAULT_CACERT_PATH}|g;" run_on_bastion_primary.sh
+      # inject runner-side vars into the script safely (simple env substitution)
+      sed -i \
+        -e "s|\${VAULT_NODE_IPS_ONE_LINE}|${VAULT_NODE_IPS_ONE_LINE}|g" \
+        -e "s|\${SSH_KEY_PATH_ON_BASTION}|${SSH_KEY_PATH_ON_BASTION}|g" \
+        -e "s|\${SSH_USER}|${SSH_USER}|g" \
+        -e "s|\${VAULT_ADDR_LOCAL}|${VAULT_ADDR_LOCAL}|g" \
+        -e "s|\${VAULT_CACERT_PATH}|${VAULT_CACERT_PATH}|g" \
+        vault_leader_status.sh
 
-    # --------- Send via SSM (simple, like your earlier working approach) ----------
-    - echo "=== [PRIMARY] Send SSM command ==="
+      chmod +x vault_leader_status.sh
+      B64_SCRIPT="$(base64 vault_leader_status.sh | tr -d '\n')"
+      export B64_SCRIPT
+
+    # 4) Send to bastion via SSM + print output
     - |
-      B64="$(base64 -w 0 run_on_bastion_primary.sh)"
-      CMD="echo '${B64}' | base64 -d > /tmp/run_on_bastion_primary.sh && chmod +x /tmp/run_on_bastion_primary.sh && /tmp/run_on_bastion_primary.sh"
-      PARAMS="$(jq -nc --arg c "${CMD}" '{commands:[$c]}')"
-
+      echo "=== [$TARGET] Sending SSM command to bastion ${BASTION_INSTANCE_ID} (${AWS_REGION}) ==="
       CMD_ID="$(aws ssm send-command \
-        --region "${PRIMARY_REGION}" \
-        --instance-ids "${PRIMARY_BASTION_INSTANCE_ID}" \
+        --region "${AWS_REGION}" \
+        --instance-ids "${BASTION_INSTANCE_ID}" \
         --document-name "AWS-RunShellScript" \
-        --parameters "${PARAMS}" \
+        --parameters "commands=[
+          \"echo ${B64_SCRIPT} | base64 -d > /tmp/vault_leader_status.sh\",
+          \"chmod +x /tmp/vault_leader_status.sh\",
+          \"bash /tmp/vault_leader_status.sh\"
+        ]" \
         --query "Command.CommandId" \
         --output text)"
+      echo "SSM CommandId: ${CMD_ID}"
 
-      echo "PRIMARY CommandId: ${CMD_ID}"
-      aws ssm wait command-executed --region "${PRIMARY_REGION}" --command-id "${CMD_ID}" --instance-id "${PRIMARY_BASTION_INSTANCE_ID}" || true
-
-      echo "===== [PRIMARY] STDOUT ====="
-      aws ssm get-command-invocation --region "${PRIMARY_REGION}" --command-id "${CMD_ID}" --instance-id "${PRIMARY_BASTION_INSTANCE_ID}" --query "StandardOutputContent" --output text || true
-
-      echo "===== [PRIMARY] STDERR ====="
-      aws ssm get-command-invocation --region "${PRIMARY_REGION}" --command-id "${CMD_ID}" --instance-id "${PRIMARY_BASTION_INSTANCE_ID}" --query "StandardErrorContent" --output text || true
-
-      STATUS="$(aws ssm get-command-invocation --region "${PRIMARY_REGION}" --command-id "${CMD_ID}" --instance-id "${PRIMARY_BASTION_INSTANCE_ID}" --query "Status" --output text)"
-      echo "PRIMARY SSM Status: ${STATUS}"
-      [ "${STATUS}" = "Success" ]
-
-vault-status-dr:
-  stage: vault_status
-  image: amazon/aws-cli:2.15.57
-  tags:
-    - sqrunners-k8s
-  variables:
-    KUBERNETES_POD_LABELS_INTERNET_ALLOW: "internet-allow"
-    # This avoids your "sts.us-east-1.amazonaws.com timeout" by using global STS endpoint behavior
-    AWS_STS_REGIONAL_ENDPOINTS: "legacy"
-  id_tokens:
-    GITLAB_OIDC_TOKEN:
-      aud: "https://gitlab.corp.zscaler.com"
-  script:
-    - set -euo pipefail
-    - yum -y install jq openssh-clients coreutils perl >/dev/null 2>&1 || true
-    - aws --version
-    - jq --version || true
-
-    # --------- DR CONFIG ----------
-    - DR_REGION="us-east-1"
-    - DR_BASTION_INSTANCE_ID="i-076259481ae826b71"
-    - DR_VAULT_TAG_NAME="vaas-dev-dr"
-    - DR_SSH_KEY_PATH_ON_BASTION="/usr/bin/vaas-dev-dr/vault-dev-dr-ssh-key.pem"
-    - DR_VAULT_SSH_USER="ubuntu"
-    - VAULT_ADDR_LOCAL="https://127.0.0.1:8200"
-    - VAULT_CACERT_PATH="/etc/vault.d/tls/ca.pem"
-    - STAGE_ROLE_ARN="arn:aws:iam::792014834907:role/gitlab-vaas-iac-role"
-
-    - echo "=== [DR] Assume role via OIDC ==="
     - |
-      aws_sts_output="$(aws sts assume-role-with-web-identity \
-        --role-arn "${STAGE_ROLE_ARN}" \
-        --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}-DR" \
-        --web-identity-token "${GITLAB_OIDC_TOKEN}" \
-        --duration-seconds 3600)"
-      export AWS_ACCESS_KEY_ID="$(echo "$aws_sts_output" | jq -r '.Credentials.AccessKeyId')"
-      export AWS_SECRET_ACCESS_KEY="$(echo "$aws_sts_output" | jq -r '.Credentials.SecretAccessKey')"
-      export AWS_SESSION_TOKEN="$(echo "$aws_sts_output" | jq -r '.Credentials.SessionToken')"
-    - aws sts get-caller-identity
+      echo "=== [$TARGET] Waiting for SSM execution ==="
+      set +e
+      aws ssm wait command-executed \
+        --region "${AWS_REGION}" \
+        --command-id "${CMD_ID}" \
+        --instance-id "${BASTION_INSTANCE_ID}"
+      WAIT_RC=$?
+      set -e
 
-    - echo "=== [DR] Discovering Vault nodes by tag Name=${DR_VAULT_TAG_NAME} in ${DR_REGION} ==="
-    - |
-      DR_NODE_IPS="$(aws ec2 describe-instances \
-        --region "${DR_REGION}" \
-        --filters "Name=tag:Name,Values=${DR_VAULT_TAG_NAME}" "Name=instance-state-name,Values=running" \
-        --query "Reservations[].Instances[].PrivateIpAddress" \
-        --output text)"
-      echo "Found node IPs: ${DR_NODE_IPS}"
-      [ -n "${DR_NODE_IPS}" ]
+      echo "==== [$TARGET] STDOUT ===="
+      aws ssm get-command-invocation \
+        --region "${AWS_REGION}" \
+        --command-id "${CMD_ID}" \
+        --instance-id "${BASTION_INSTANCE_ID}" \
+        --query "StandardOutputContent" \
+        --output text || true
 
-    - echo "=== [DR] Build script to run on bastion ==="
-    - |
-      cat > run_on_bastion_dr.sh <<'EOS'
-      set -euo pipefail
+      echo "==== [$TARGET] STDERR ===="
+      aws ssm get-command-invocation \
+        --region "${AWS_REGION}" \
+        --command-id "${CMD_ID}" \
+        --instance-id "${BASTION_INSTANCE_ID}" \
+        --query "StandardErrorContent" \
+        --output text || true
 
-      VAULT_NODE_IPS="__VAULT_NODE_IPS__"
-      SSH_KEY="__SSH_KEY__"
-      SSH_USER="__SSH_USER__"
-      VAULT_ADDR_LOCAL="__VAULT_ADDR_LOCAL__"
-      VAULT_CACERT_PATH="__VAULT_CACERT_PATH__"
-
-      run_status() {
-        local ip="$1"
-        sudo -i bash -lc "ssh -i '${SSH_KEY}' \
-          -o StrictHostKeyChecking=no \
-          -o UserKnownHostsFile=/dev/null \
-          ${SSH_USER}@${ip} \
-          \"sudo -i bash -lc 'export VAULT_ADDR=${VAULT_ADDR_LOCAL}; export VAULT_CACERT=${VAULT_CACERT_PATH}; vault status'\""
-      }
-
-      LEADER_IP=""
-      for ip in ${VAULT_NODE_IPS}; do
-        OUT="$(run_status "${ip}" 2>&1 || true)"
-        if echo "${OUT}" | grep -qiE '^HA Mode[[:space:]]+active$'; then
-          LEADER_IP="${ip}"
-          break
-        fi
-      done
-
-      if [ -z "${LEADER_IP}" ]; then
-        echo "ERROR: Leader not found (no node returned HA Mode active)"
-        exit 2
-      fi
-
-      echo "=== DR LEADER: ${LEADER_IP} ==="
-      run_status "${LEADER_IP}"
-EOS
-
-      perl -0777 -i -pe "s|__VAULT_NODE_IPS__|${DR_NODE_IPS}|g;
-                         s|__SSH_KEY__|${DR_SSH_KEY_PATH_ON_BASTION}|g;
-                         s|__SSH_USER__|${DR_VAULT_SSH_USER}|g;
-                         s|__VAULT_ADDR_LOCAL__|${VAULT_ADDR_LOCAL}|g;
-                         s|__VAULT_CACERT_PATH__|${VAULT_CACERT_PATH}|g;" run_on_bastion_dr.sh
-
-    - echo "=== [DR] Send SSM command ==="
-    - |
-      B64="$(base64 -w 0 run_on_bastion_dr.sh)"
-      CMD="echo '${B64}' | base64 -d > /tmp/run_on_bastion_dr.sh && chmod +x /tmp/run_on_bastion_dr.sh && /tmp/run_on_bastion_dr.sh"
-      PARAMS="$(jq -nc --arg c "${CMD}" '{commands:[$c]}')"
-
-      CMD_ID="$(aws ssm send-command \
-        --region "${DR_REGION}" \
-        --instance-ids "${DR_BASTION_INSTANCE_ID}" \
-        --document-name "AWS-RunShellScript" \
-        --parameters "${PARAMS}" \
-        --query "Command.CommandId" \
-        --output text)"
-
-      echo "DR CommandId: ${CMD_ID}"
-      aws ssm wait command-executed --region "${DR_REGION}" --command-id "${CMD_ID}" --instance-id "${DR_BASTION_INSTANCE_ID}" || true
-
-      echo "===== [DR] STDOUT ====="
-      aws ssm get-command-invocation --region "${DR_REGION}" --command-id "${CMD_ID}" --instance-id "${DR_BASTION_INSTANCE_ID}" --query "StandardOutputContent" --output text || true
-
-      echo "===== [DR] STDERR ====="
-      aws ssm get-command-invocation --region "${DR_REGION}" --command-id "${CMD_ID}" --instance-id "${DR_BASTION_INSTANCE_ID}" --query "StandardErrorContent" --output text || true
-
-      STATUS="$(aws ssm get-command-invocation --region "${DR_REGION}" --command-id "${CMD_ID}" --instance-id "${DR_BASTION_INSTANCE_ID}" --query "Status" --output text)"
-      echo "DR SSM Status: ${STATUS}"
-      [ "${STATUS}" = "Success" ]
+      exit $WAIT_RC
