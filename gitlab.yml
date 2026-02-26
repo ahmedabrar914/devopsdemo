@@ -1,6 +1,7 @@
 workflow:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "push"'
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
     - when: never
@@ -9,11 +10,19 @@ stages:
   - vault-status
 
 variables:
-  STAGE_ROLE_ARN: "arn:aws:iam::792014834907:role/gitlab-vaas-iac-role"
   AWS_REGION: "us-west-2"
+
+  # Staging assume-role
+  STAGE_ROLE_ARN: "arn:aws:iam::792014834907:role/gitlab-vaas-iac-role"
+
+  # Bastion + vault node details (staging)
   BASTION_INSTANCE_ID: "i-035c86b6405b6ab1b"
   VAULT_NODE_IP: "10.82.0.111"
+
+  # On bastion
   SSH_KEY_PATH_ON_BASTION: "/usr/bin/vaas-staging/vault-staging-ssh-key.pem"
+
+  # On vault node
   VAULT_ADDR_LOCAL: "https://127.0.0.1:8200"
   VAULT_CACERT_PATH: "/etc/vault.d/tls/ca.pem"
 
@@ -23,56 +32,60 @@ vault-status-staging:
   id_tokens:
     GITLAB_OIDC_TOKEN:
       aud: https://gitlab.corp.zscaler.com
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "dr-test"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
   script:
     - set -euo pipefail
 
-    # Assume role
+    # Assume AWS role using GitLab OIDC token
     - |
-      aws_sts_output=$(aws sts assume-role-with-web-identity \
+      aws_sts_output="$(aws sts assume-role-with-web-identity \
         --role-arn "${STAGE_ROLE_ARN}" \
         --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}" \
         --web-identity-token "${GITLAB_OIDC_TOKEN}" \
         --duration-seconds 3600 \
         --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
-        --output text)
+        --output text)"
 
-      export AWS_ACCESS_KEY_ID=$(echo "$aws_sts_output" | awk '{print $1}')
-      export AWS_SECRET_ACCESS_KEY=$(echo "$aws_sts_output" | awk '{print $2}')
-      export AWS_SESSION_TOKEN=$(echo "$aws_sts_output" | awk '{print $3}')
+      export AWS_ACCESS_KEY_ID="$(echo "$aws_sts_output" | awk '{print $1}')"
+      export AWS_SECRET_ACCESS_KEY="$(echo "$aws_sts_output" | awk '{print $2}')"
+      export AWS_SESSION_TOKEN="$(echo "$aws_sts_output" | awk '{print $3}')"
 
+      echo "Caller identity:"
       aws sts get-caller-identity
 
-    # Build command (same logic as your local success)
+    # Build the exact working command, but as a script (no escaping hell)
     - |
-      REMOTE_CMD="sudo -i bash -lc 'ssh -i ${SSH_KEY_PATH_ON_BASTION} \
+      cat > run_on_bastion.sh <<'EOS'
+      set -euo pipefail
+
+      sudo -i bash -lc 'ssh -i '"${SSH_KEY_PATH_ON_BASTION}"' \
         -o StrictHostKeyChecking=no \
         -o UserKnownHostsFile=/dev/null \
-        ubuntu@${VAULT_NODE_IP} \
-        \"sudo -i bash -lc '\''export VAULT_ADDR=${VAULT_ADDR_LOCAL}; export VAULT_CACERT=${VAULT_CACERT_PATH}; vault status'\''\"'"
+        ubuntu@'"${VAULT_NODE_IP}"' \
+        "sudo -i bash -lc '\''export VAULT_ADDR='"${VAULT_ADDR_LOCAL}"'; export VAULT_CACERT='"${VAULT_CACERT_PATH}"'; vault status'\''"'
+      EOS
 
-      echo "REMOTE_CMD=${REMOTE_CMD}"
+      echo "=== Script that will run on bastion ==="
+      cat run_on_bastion.sh
 
-    # Escape for JSON safely using python (available on many runners; if not, tell me)
+      # Base64 encode so SSM JSON is always valid
+      REMOTE_B64="$(base64 < run_on_bastion.sh | tr -d '\n')"
+
+    # Send command via SSM to bastion
     - |
-      python3 - <<'PY' > ssm-input.json
-import json, os
-payload = {
-  "DocumentName": "AWS-RunShellScript",
-  "InstanceIds": [os.environ["BASTION_INSTANCE_ID"]],
-  "Parameters": {"commands": [os.environ["REMOTE_CMD"]]},
-}
-print(json.dumps(payload))
-PY
-
-      cat ssm-input.json
-
-    # Send + print output
-    - |
-      CMD_ID=$(aws ssm send-command \
+      CMD_ID="$(aws ssm send-command \
         --region "${AWS_REGION}" \
-        --cli-input-json file://ssm-input.json \
+        --instance-ids "${BASTION_INSTANCE_ID}" \
+        --document-name "AWS-RunShellScript" \
+        --parameters commands="[
+          \"echo ${REMOTE_B64} | base64 -d > /tmp/run_on_bastion.sh\",
+          \"chmod +x /tmp/run_on_bastion.sh\",
+          \"bash /tmp/run_on_bastion.sh\"
+        ]" \
         --query "Command.CommandId" \
-        --output text)
+        --output text)"
 
       echo "CommandId: ${CMD_ID}"
 
