@@ -1,9 +1,7 @@
 workflow:
   rules:
-    # Run on manual UI run and API trigger (keeps it DR-only)
     - if: '$CI_PIPELINE_SOURCE == "web"'
     - if: '$CI_PIPELINE_SOURCE == "api"'
-    # Optional: allow pushes to dr-test branch for testing
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "dr-test"'
     - when: never
 
@@ -17,46 +15,10 @@ default:
   before_script:
     - |
       set -euo pipefail
-      # Install jq + curl (amazon/aws-cli is based on AL2)
       yum -y install jq curl >/dev/null 2>&1 || true
 
 # -----------------------------
-# OIDC Assume Role (REGIONAL STS)
-# -----------------------------
-.assume_aws_role: &assume_aws_role
-  - |
-    set -euo pipefail
-
-    : "${AWS_REGION:?missing AWS_REGION}"
-    : "${ROLE_ARN:?missing ROLE_ARN}"
-
-    export AWS_DEFAULT_REGION="${AWS_REGION}"
-    export AWS_STS_REGIONAL_ENDPOINTS="regional"
-
-    echo "Testing STS reachability: https://sts.${AWS_REGION}.amazonaws.com"
-    curl -sS -m 5 "https://sts.${AWS_REGION}.amazonaws.com" >/dev/null
-
-    echo "Assuming role via OIDC: ${ROLE_ARN}"
-    aws_sts_output=$(aws sts assume-role-with-web-identity \
-      --region "${AWS_REGION}" \
-      --endpoint-url "https://sts.${AWS_REGION}.amazonaws.com" \
-      --role-arn "${ROLE_ARN}" \
-      --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}" \
-      --web-identity-token "${GITLAB_OIDC_TOKEN}" \
-      --duration-seconds 3600 \
-      --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
-      --output text)
-
-    export AWS_ACCESS_KEY_ID=$(echo "$aws_sts_output" | awk '{print $1}')
-    export AWS_SECRET_ACCESS_KEY=$(echo "$aws_sts_output" | awk '{print $2}')
-    export AWS_SESSION_TOKEN=$(echo "$aws_sts_output" | awk '{print $3}')
-
-    aws sts get-caller-identity \
-      --region "${AWS_REGION}" \
-      --endpoint-url "https://sts.${AWS_REGION}.amazonaws.com"
-
-# -----------------------------
-# Shared job template
+# Shared runner logic
 # -----------------------------
 .ssm_vault_status:
   stage: status
@@ -72,31 +34,50 @@ default:
       : "${SSH_KEY_PATH:?missing SSH_KEY_PATH}"
       : "${VAULT_ADDR_LOCAL:?missing VAULT_ADDR_LOCAL}"
 
-      # Assume role in the same region we will call SSM in
       export AWS_REGION="${TARGET_REGION}"
       export AWS_DEFAULT_REGION="${TARGET_REGION}"
+      export AWS_STS_REGIONAL_ENDPOINTS="regional"
 
-      # OIDC assume role (regional STS)
-      <<: *assume_aws_role
+      echo "Testing STS reachability: https://sts.${AWS_REGION}.amazonaws.com"
+      curl -sS -m 5 "https://sts.${AWS_REGION}.amazonaws.com" >/dev/null
 
-      echo "Sending SSM command to bastion ${BASTION_INSTANCE_ID} in ${TARGET_REGION}"
+      echo "Assuming role via OIDC: ${ROLE_ARN}"
+      aws_sts_output=$(aws sts assume-role-with-web-identity \
+        --region "${AWS_REGION}" \
+        --endpoint-url "https://sts.${AWS_REGION}.amazonaws.com" \
+        --role-arn "${ROLE_ARN}" \
+        --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}" \
+        --web-identity-token "${GITLAB_OIDC_TOKEN}" \
+        --duration-seconds 3600 \
+        --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+        --output text)
 
-      # Remote script executed ON BASTION
-      read -r -d '' REMOTE_SCRIPT <<'EOF'
+      export AWS_ACCESS_KEY_ID=$(echo "$aws_sts_output" | awk '{print $1}')
+      export AWS_SECRET_ACCESS_KEY=$(echo "$aws_sts_output" | awk '{print $2}')
+      export AWS_SESSION_TOKEN=$(echo "$aws_sts_output" | awk '{print $3}')
+
+      aws sts get-caller-identity \
+        --region "${AWS_REGION}" \
+        --endpoint-url "https://sts.${AWS_REGION}.amazonaws.com"
+
+      echo "Preparing remote script file (no heredoc)…"
+      cat > remote.sh <<'SCRIPT'
       set -euo pipefail
-      
-      VAULT_SSH_USER="__VAULT_SSH_USER__"
-      VAULT_ADDR_LOCAL="__VAULT_ADDR_LOCAL__"
-      VAULT_NODES="__VAULT_NODES__"
-      SSH_KEY_PATH="__SSH_KEY_PATH__"
-      
+
+      : "${VAULT_SSH_USER:?}"
+      : "${VAULT_ADDR_LOCAL:?}"
+      : "${VAULT_NODES:?}"
+      : "${SSH_KEY_PATH:?}"
+
       KNOWN_HOSTS_FILE="/tmp/known_hosts_vault"
+      # Split VAULT_NODES by space
       read -r -a NODES <<< "${VAULT_NODES}"
-      
+
       ssh_vault() {
-        local host="$1"; shift
+        local host="$1"; shift || true
+        # Fix host key changed / known_hosts mismatch automatically
         ssh-keygen -f "${KNOWN_HOSTS_FILE}" -R "${host}" >/dev/null 2>&1 || true
-      
+
         ssh -i "${SSH_KEY_PATH}" \
           -o UserKnownHostsFile="${KNOWN_HOSTS_FILE}" \
           -o StrictHostKeyChecking=accept-new \
@@ -104,7 +85,7 @@ default:
           "${VAULT_SSH_USER}@${host}" \
           "bash -lc $'set -euo pipefail\n$*'"
       }
-    
+
       find_leader() {
         for n in "${NODES[@]}"; do
           standby="$(ssh_vault "$n" "export VAULT_ADDR='${VAULT_ADDR_LOCAL}'; vault status -format=json | jq -r .standby" || true)"
@@ -115,39 +96,33 @@ default:
         done
         return 1
       }
-  
+
       leader="$(find_leader || true)"
       if [[ -z "${leader:-}" ]]; then
         echo "ERROR: Could not find leader. Nodes=${VAULT_NODES}" >&2
         exit 1
       fi
-      
+
       echo "Leader: ${leader}"
       ssh_vault "$leader" "export VAULT_ADDR='${VAULT_ADDR_LOCAL}'; vault status -format=json | jq ."
-      EOF
-      
+      SCRIPT
 
+      chmod +x remote.sh
+      REMOTE_B64="$(base64 -w0 remote.sh)"
 
-      # Substitute placeholders
-      REMOTE_SCRIPT="${REMOTE_SCRIPT//__VAULT_SSH_USER__/${VAULT_SSH_USER}}"
-      REMOTE_SCRIPT="${REMOTE_SCRIPT//__VAULT_ADDR_LOCAL__/${VAULT_ADDR_LOCAL}}"
-      REMOTE_SCRIPT="${REMOTE_SCRIPT//__VAULT_NODES__/${VAULT_NODES}}"
-      REMOTE_SCRIPT="${REMOTE_SCRIPT//__SSH_KEY_PATH__/${SSH_KEY_PATH}}"
-
-      CMD_B64="$(printf "%s" "${REMOTE_SCRIPT}" | base64 -w0)"
+      echo "Sending SSM command to bastion ${BASTION_INSTANCE_ID} in ${TARGET_REGION}"
 
       command_id="$(aws ssm send-command \
         --region "${TARGET_REGION}" \
         --instance-ids "${BASTION_INSTANCE_ID}" \
         --document-name "AWS-RunShellScript" \
         --comment "Vault leader status (${TARGET_REGION})" \
-        --parameters commands="echo ${CMD_B64} | base64 -d | bash" \
+        --parameters commands="export VAULT_SSH_USER='${VAULT_SSH_USER}' VAULT_ADDR_LOCAL='${VAULT_ADDR_LOCAL}' VAULT_NODES='${VAULT_NODES}' SSH_KEY_PATH='${SSH_KEY_PATH}'; echo ${REMOTE_B64} | base64 -d > /tmp/remote.sh; bash /tmp/remote.sh" \
         --query 'Command.CommandId' \
         --output text)"
 
       echo "SSM CommandId: ${command_id}"
 
-      # Poll until done
       while true; do
         status="$(aws ssm get-command-invocation \
           --region "${TARGET_REGION}" \
@@ -156,7 +131,6 @@ default:
           --query Status --output text)"
 
         echo "SSM Status: ${status}"
-
         case "${status}" in
           Success)
             echo "----- OUTPUT (${TARGET_REGION}) -----"
@@ -185,13 +159,12 @@ default:
 # -----------------------------
 # Jobs
 # -----------------------------
-
 status-usw2:
   extends: .ssm_vault_status
   variables:
     TARGET_REGION: "us-west-2"
     ROLE_ARN: "arn:aws:iam::792014834907:role/gitlab-vaas-iac-role"
-    BASTION_INSTANCE_ID: "i-035c86b6405b6ab1b"
+    BASTION_INSTANCE_ID: "REPLACE_ME_USW2_BASTION"
     VAULT_SSH_USER: "ubuntu"
     SSH_KEY_PATH: "/usr/bin/vaas-staging/vault-staging-ssh-key.pem"
     VAULT_ADDR_LOCAL: "https://127.0.0.1:8200"
@@ -202,7 +175,7 @@ status-use1:
   variables:
     TARGET_REGION: "us-east-1"
     ROLE_ARN: "arn:aws:iam::100828516796:role/gitlab-vaas-iac-role"
-    BASTION_INSTANCE_ID: "i-076259481ae826b71"
+    BASTION_INSTANCE_ID: "REPLACE_ME_USE1_BASTION"
     VAULT_SSH_USER: "ubuntu"
     SSH_KEY_PATH: "/root/vaas-dev-dr/vault-dev-dr-ssh-key.pem"
     VAULT_ADDR_LOCAL: "https://127.0.0.1:8200"
