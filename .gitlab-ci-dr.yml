@@ -7,12 +7,8 @@ workflow:
 stages: [dr-status]
 
 variables:
-  # Staging only
-  STAGE_ROLE_ARN: "arn:aws:iam::792014834907:role/gitlab-vaas-iac-role"
-
-  # Make runner able to reach AWS endpoints (same as your tfsec job)
-  KUBERNETES_POD_LABELS_INTERNET_ALLOW: "internet=allow"
-  AWS_STS_REGIONAL_ENDPOINTS: "regional"
+  # Your existing stage role
+  STAGE_ROLE_ARN: arn:aws:iam::792014834907:role/gitlab-vaas-iac-role
 
 default:
   image: amazon/aws-cli:2.15.57
@@ -20,11 +16,13 @@ default:
     GITLAB_OIDC_TOKEN:
       aud: https://gitlab.corp.zscaler.com
   before_script:
+    - set -euo pipefail
+    - yum -y install jq >/dev/null 2>&1 || true
     - |
-      set -euo pipefail
-      yum -y install jq >/dev/null 2>&1 || true
-
-      # Assume staging role using GitLab OIDC
+      echo "Testing STS reachability..."
+      curl -sS --max-time 5 https://sts.amazonaws.com >/dev/null
+      echo "STS reachable ✅"
+    - |
       aws_sts_output=$(aws sts assume-role-with-web-identity \
         --role-arn "${STAGE_ROLE_ARN}" \
         --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}" \
@@ -32,14 +30,11 @@ default:
         --duration-seconds 3600 \
         --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
         --output text)
-
-      export AWS_ACCESS_KEY_ID="$(echo "$aws_sts_output" | awk '{print $1}')"
-      export AWS_SECRET_ACCESS_KEY="$(echo "$aws_sts_output" | awk '{print $2}')"
-      export AWS_SESSION_TOKEN="$(echo "$aws_sts_output" | awk '{print $3}')"
-
+      export $(printf "AWS_ACCESS_KEY_ID=%s AWS_SECRET_ACCESS_KEY=%s AWS_SESSION_TOKEN=%s" $aws_sts_output)
+      echo "Assumed AWS role: ${STAGE_ROLE_ARN}"
       aws sts get-caller-identity
 
-.dr_status_job:
+.dr_bastion_status:
   stage: dr-status
   script:
     - |
@@ -47,40 +42,50 @@ default:
 
       : "${TARGET_REGION:?missing TARGET_REGION}"
       : "${BASTION_INSTANCE_ID:?missing BASTION_INSTANCE_ID}"
-      : "${VAULT_NODES:?missing VAULT_NODES}"
       : "${VAULT_SSH_USER:?missing VAULT_SSH_USER}"
       : "${SSH_KEY_PATH:?missing SSH_KEY_PATH}"
       : "${VAULT_ADDR_LOCAL:?missing VAULT_ADDR_LOCAL}"
+      : "${VAULT_NODES:?missing VAULT_NODES}"
 
-      export AWS_REGION="${TARGET_REGION}"
-      export AWS_DEFAULT_REGION="${TARGET_REGION}"
+      echo "Region: ${TARGET_REGION}"
+      echo "Bastion: ${BASTION_INSTANCE_ID}"
+      echo "Vault nodes: ${VAULT_NODES}"
+      echo "SSH key path on bastion: ${SSH_KEY_PATH}"
+      echo "Vault addr (local on vault node): ${VAULT_ADDR_LOCAL}"
 
-      echo "Creating remote script file..."
-      cat > remote.sh <<'SCRIPT'
+      # --- remote script that will run on the bastion via SSM ---
+      cat > remote.sh <<'EOF'
       set -euo pipefail
 
-      : "${VAULT_SSH_USER:?}"
-      : "${VAULT_ADDR_LOCAL:?}"
-      : "${VAULT_NODES:?}"
-      : "${SSH_KEY_PATH:?}"
+      : "${VAULT_SSH_USER:?missing}"
+      : "${SSH_KEY_PATH:?missing}"
+      : "${VAULT_ADDR_LOCAL:?missing}"
+      : "${VAULT_NODES:?missing}"
 
-      KNOWN_HOSTS_FILE="/tmp/known_hosts_vault"
+      # Use isolated known_hosts to avoid "REMOTE HOST IDENTIFICATION HAS CHANGED"
+      export HOME="/tmp"
+      mkdir -p /tmp/.ssh
+      chmod 700 /tmp/.ssh
+      touch /tmp/.ssh/known_hosts
+      chmod 600 /tmp/.ssh/known_hosts
+
       read -r -a NODES <<< "${VAULT_NODES}"
 
       ssh_vault() {
-        local host="$1"; shift || true
-        ssh-keygen -f "${KNOWN_HOSTS_FILE}" -R "${host}" >/dev/null 2>&1 || true
-        ssh -i "${SSH_KEY_PATH}" \
-          -o UserKnownHostsFile="${KNOWN_HOSTS_FILE}" \
-          -o StrictHostKeyChecking=accept-new \
-          -o LogLevel=ERROR \
+        local host="$1"; shift
+        ssh \
+          -i "${SSH_KEY_PATH}" \
+          -o StrictHostKeyChecking=no \
+          -o UserKnownHostsFile=/tmp/.ssh/known_hosts \
+          -o IdentitiesOnly=yes \
+          -o ConnectTimeout=10 \
           "${VAULT_SSH_USER}@${host}" \
           "bash -lc $'set -euo pipefail\n$*'"
       }
 
       find_leader() {
         for n in "${NODES[@]}"; do
-          standby="$(ssh_vault "$n" "export VAULT_ADDR='${VAULT_ADDR_LOCAL}'; vault status -format=json | jq -r .standby" || true)"
+          standby="$(ssh_vault "$n" "export VAULT_ADDR='${VAULT_ADDR_LOCAL}'; vault status -format=json | jq -r .standby" 2>/dev/null || true)"
           if [[ "$standby" == "false" ]]; then
             echo "$n"
             return 0
@@ -90,53 +95,84 @@ default:
       }
 
       leader="$(find_leader || true)"
-      if [[ -z "${leader:-}" ]]; then
-        echo "ERROR: Could not find leader. Nodes=${VAULT_NODES}" >&2
+      if [[ -z "${leader}" ]]; then
+        echo "ERROR: Could not find leader. Nodes: ${VAULT_NODES}" >&2
+        echo "Debug: Trying vault status on each node..." >&2
+        for n in "${NODES[@]}"; do
+          echo "---- ${n} ----"
+          ssh_vault "$n" "export VAULT_ADDR='${VAULT_ADDR_LOCAL}'; vault status || true" || true
+        done
         exit 1
       fi
 
-      echo "Leader node: ${leader}"
-      echo "---- vault status ----"
+      echo "✅ Leader: ${leader}"
+
+      echo
+      echo "===== vault version (leader) ====="
+      ssh_vault "$leader" "vault version"
+
+      echo
+      echo "===== vault status (leader) ====="
       ssh_vault "$leader" "export VAULT_ADDR='${VAULT_ADDR_LOCAL}'; vault status -format=json | jq ."
 
-      echo "---- replication status ----"
-      ssh_vault "$leader" "export VAULT_ADDR='${VAULT_ADDR_LOCAL}'; vault read -format=json sys/replication/status | jq .data"
-      SCRIPT
+      echo
+      echo "===== replication status (leader) ====="
+      ssh_vault "$leader" "export VAULT_ADDR='${VAULT_ADDR_LOCAL}'; vault read -format=json sys/replication/status | jq ."
+      EOF
 
       REMOTE_B64="$(base64 -w0 remote.sh)"
 
-      echo "Sending SSM command to bastion ${BASTION_INSTANCE_ID} in ${TARGET_REGION}"
+      echo "Sending SSM command..."
       command_id="$(aws ssm send-command \
         --region "${TARGET_REGION}" \
         --instance-ids "${BASTION_INSTANCE_ID}" \
         --document-name "AWS-RunShellScript" \
-        --comment "Vault status + replication status (${TARGET_REGION})" \
-        --parameters commands="export VAULT_SSH_USER='${VAULT_SSH_USER}' VAULT_ADDR_LOCAL='${VAULT_ADDR_LOCAL}' VAULT_NODES='${VAULT_NODES}' SSH_KEY_PATH='${SSH_KEY_PATH}'; echo ${REMOTE_B64} | base64 -d > /tmp/remote.sh; bash /tmp/remote.sh" \
+        --comment "Vault DR status via bastion" \
+        --parameters "commands=[
+          \"set -euo pipefail\",
+          \"echo ${REMOTE_B64} | base64 -d > /tmp/remote.sh\",
+          \"chmod +x /tmp/remote.sh\",
+          \"export VAULT_SSH_USER=${VAULT_SSH_USER}\",
+          \"export SSH_KEY_PATH=${SSH_KEY_PATH}\",
+          \"export VAULT_ADDR_LOCAL=${VAULT_ADDR_LOCAL}\",
+          \"export VAULT_NODES='${VAULT_NODES}'\",
+          \"bash /tmp/remote.sh\"
+        ]" \
         --query 'Command.CommandId' \
         --output text)"
 
       echo "SSM CommandId: ${command_id}"
 
-      # Wait for completion
+      echo "Waiting for SSM output..."
       while true; do
         status="$(aws ssm get-command-invocation \
           --region "${TARGET_REGION}" \
           --command-id "${command_id}" \
           --instance-id "${BASTION_INSTANCE_ID}" \
-          --query Status --output text)"
+          --query Status \
+          --output text)"
+
         echo "SSM Status: ${status}"
+
         case "${status}" in
           Success)
-            echo "===== OUTPUT (${TARGET_REGION}) ====="
             aws ssm get-command-invocation \
               --region "${TARGET_REGION}" \
               --command-id "${command_id}" \
               --instance-id "${BASTION_INSTANCE_ID}" \
-              --query StandardOutputContent --output text
+              --query StandardOutputContent \
+              --output text
             exit 0
             ;;
           Failed|Cancelled|TimedOut)
-            echo "===== ERROR (${TARGET_REGION}) ====="
+            echo "---- STDERR ----"
+            aws ssm get-command-invocation \
+              --region "${TARGET_REGION}" \
+              --command-id "${command_id}" \
+              --instance-id "${BASTION_INSTANCE_ID}" \
+              --query StandardErrorContent \
+              --output text || true
+            echo "---- FULL JSON ----"
             aws ssm get-command-invocation \
               --region "${TARGET_REGION}" \
               --command-id "${command_id}" \
@@ -150,22 +186,24 @@ default:
         esac
       done
 
+# --------- US-WEST-2 (PRIMARY) ----------
 status-usw2:
-  extends: .dr_status_job
+  extends: .dr_bastion_status
   variables:
     TARGET_REGION: "us-west-2"
-    BASTION_INSTANCE_ID: "REPLACE_USW2_BASTION_ID"
+    BASTION_INSTANCE_ID: "i-REPLACE_USW2_BASTION"
     VAULT_SSH_USER: "ubuntu"
     SSH_KEY_PATH: "/usr/bin/vaas-staging/vault-staging-ssh-key.pem"
     VAULT_ADDR_LOCAL: "https://127.0.0.1:8200"
-    VAULT_NODES: "REPLACE_USW2_NODE1_IP REPLACE_USW2_NODE2_IP REPLACE_USW2_NODE3_IP"
+    VAULT_NODES: "10.82.0.111 10.82.0.136 10.82.0.190"
 
+# --------- US-EAST-1 (DR) ----------
 status-use1:
-  extends: .dr_status_job
+  extends: .dr_bastion_status
   variables:
     TARGET_REGION: "us-east-1"
-    BASTION_INSTANCE_ID: "REPLACE_USE1_BASTION_ID"
+    BASTION_INSTANCE_ID: "i-REPLACE_USE1_BASTION"
     VAULT_SSH_USER: "ubuntu"
-    SSH_KEY_PATH: "/root/vaas-dev-dr/vault-dev-dr-ssh-key.pem"
+    SSH_KEY_PATH: "/usr/bin/vaas-staging/vault-dev-dr-ssh-key.pem"
     VAULT_ADDR_LOCAL: "https://127.0.0.1:8200"
-    VAULT_NODES: "REPLACE_USE1_NODE1_IP REPLACE_USE1_NODE2_IP REPLACE_USE1_NODE3_IP"
+    VAULT_NODES: "10.75.0.182 10.75.0.168 10.75.0.126 10.75.0.111"
