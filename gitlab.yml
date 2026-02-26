@@ -1,0 +1,84 @@
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - when: never
+
+stages:
+  - vault-status
+
+variables:
+  STAGE_ROLE_ARN: "arn:aws:iam::792014834907:role/gitlab-vaas-iac-role"
+
+  AWS_REGION: "us-west-2"
+  BASTION_INSTANCE_ID: "i-035c86b6405b6ab1b"
+  VAULT_NODE_IP: "10.82.0.111"
+  SSH_KEY_PATH_ON_BASTION: "/usr/bin/vaas-staging/vault-staging-ssh-key.pem"
+
+  VAULT_ADDR_LOCAL: "https://127.0.0.1:8200"
+  VAULT_CACERT_PATH: "/etc/vault.d/tls/ca.pem"
+
+vault-status-staging:
+  stage: vault-status
+  image: amazon/aws-cli:2.15.57
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://gitlab.corp.zscaler.com
+  script:
+    - set -euo pipefail
+
+    # Assume staging role using GitLab OIDC
+    - |
+      aws_sts_output=$(aws sts assume-role-with-web-identity \
+        --role-arn "${STAGE_ROLE_ARN}" \
+        --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}" \
+        --web-identity-token "${GITLAB_OIDC_TOKEN}" \
+        --duration-seconds 3600 \
+        --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+        --output text)
+
+      export AWS_ACCESS_KEY_ID=$(echo "$aws_sts_output" | awk '{print $1}')
+      export AWS_SECRET_ACCESS_KEY=$(echo "$aws_sts_output" | awk '{print $2}')
+      export AWS_SESSION_TOKEN=$(echo "$aws_sts_output" | awk '{print $3}')
+
+      aws sts get-caller-identity
+
+    # SSM -> bastion -> ssh -> sudo -> export -> vault status
+    - |
+      REMOTE_CMD="sudo -i bash -lc \"ssh -i ${SSH_KEY_PATH_ON_BASTION} \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        ubuntu@${VAULT_NODE_IP} \
+        \\\"sudo -i bash -lc 'export VAULT_ADDR=${VAULT_ADDR_LOCAL}; export VAULT_CACERT=${VAULT_CACERT_PATH}; vault status'\\\"\""
+
+      CMD_ID=$(aws ssm send-command \
+        --region "${AWS_REGION}" \
+        --instance-ids "${BASTION_INSTANCE_ID}" \
+        --document-name "AWS-RunShellScript" \
+        --parameters "{\"commands\":[\"${REMOTE_CMD//\"/\\\"}\"]}" \
+        --query "Command.CommandId" \
+        --output text)
+
+      echo "CommandId: ${CMD_ID}"
+
+      aws ssm wait command-executed \
+        --region "${AWS_REGION}" \
+        --command-id "${CMD_ID}" \
+        --instance-id "${BASTION_INSTANCE_ID}"
+
+      echo "==== STDOUT ===="
+      aws ssm get-command-invocation \
+        --region "${AWS_REGION}" \
+        --command-id "${CMD_ID}" \
+        --instance-id "${BASTION_INSTANCE_ID}" \
+        --query "StandardOutputContent" \
+        --output text
+
+      echo "==== STDERR ===="
+      aws ssm get-command-invocation \
+        --region "${AWS_REGION}" \
+        --command-id "${CMD_ID}" \
+        --instance-id "${BASTION_INSTANCE_ID}" \
+        --query "StandardErrorContent" \
+        --output text
