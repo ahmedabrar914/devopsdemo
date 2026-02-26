@@ -5,81 +5,90 @@ workflow:
     - if: '$CI_COMMIT_BRANCH'
 
 stages:
-  - vault-status
+  - status
 
-variables:
-  AWS_DEFAULT_REGION: us-west-2
-  VAULT_SSH_USER: ubuntu
-
-vault-leader-status-primary-and-dr:
-  stage: vault-status
+vault-status:
+  stage: status
   image: amazon/aws-cli:2.15.57
+
+  # Everything is inside YAML as you requested
   variables:
-    KUBERNETES_POD_LABELS_INTERNET_ALLOW: "internet=allow"
+    STAGE_ROLE_ARN: "arn:aws:iam::792014834907:role/gitlab-vaas-iac-role"
+
+  parallel:
+    matrix:
+      - TARGET: "PRIMARY"
+        AWS_REGION: "us-west-2"
+        BASTION_INSTANCE_ID: "i-035c86b6405b6ab1b"
+        VAULT_NAME_TAG: "vaas-staging"
+        SSH_KEY_PATH_ON_BASTION: "/usr/bin/vaas-staging/vault-staging-ssh-key.pem"
+        VAULT_ADDR_LOCAL: "https://127.0.0.1:8200"
+        VAULT_CACERT_PATH: "/etc/vault.d/tls/ca.pem"
+        VAULT_SSH_USER: "ubuntu"
+
+      - TARGET: "DR"
+        AWS_REGION: "us-east-1"
+        BASTION_INSTANCE_ID: "i-076259481ae826b71"
+        VAULT_NAME_TAG: "vaas-dev-dr"
+        SSH_KEY_PATH_ON_BASTION: "/usr/bin/vaas-dev-dr/vault-dev-dr-ssh-key.pem"
+        VAULT_ADDR_LOCAL: "https://127.0.0.1:8200"
+        VAULT_CACERT_PATH: "/etc/vault.d/tls/ca.pem"
+        VAULT_SSH_USER: "ubuntu"
+
   id_tokens:
     GITLAB_OIDC_TOKEN:
       aud: https://gitlab.corp.zscaler.com
+
   before_script:
     - set -euo pipefail
-    - yum -y install jq python3 openssh-clients >/dev/null 2>&1 || true
-
-    # --- Assume AWS role via OIDC (same approach you used) ---
-    - |
-      echo "Assuming role via OIDC..."
-      aws_sts_output=$(aws sts assume-role-with-web-identity \
-        --role-arn "${STAGE_ROLE_ARN}" \
-        --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}" \
-        --web-identity-token "${GITLAB_OIDC_TOKEN}" \
-        --duration-seconds 3600 \
-        --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
-        --output text)
-      export AWS_ACCESS_KEY_ID="$(echo "$aws_sts_output" | awk '{print $1}')"
-      export AWS_SECRET_ACCESS_KEY="$(echo "$aws_sts_output" | awk '{print $2}')"
-      export AWS_SESSION_TOKEN="$(echo "$aws_sts_output" | awk '{print $3}')"
-      aws sts get-caller-identity
+    # tools
+    - yum -y install jq python3 coreutils openssh-clients >/dev/null 2>&1 || true
+    - aws --version
 
   script:
     - |
       set -euo pipefail
 
-      run_region() {
-        local REGION="$1"
-        local NAME_TAG="$2"
-        local BASTION_ID="$3"
-        local SSH_KEY_ON_BASTION="$4"
+      echo "=== [${TARGET}] Assuming role via OIDC ==="
+      aws_sts_output="$(aws sts assume-role-with-web-identity \
+        --region "${AWS_REGION}" \
+        --role-arn "${STAGE_ROLE_ARN}" \
+        --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}-${TARGET}" \
+        --web-identity-token "${GITLAB_OIDC_TOKEN}" \
+        --duration-seconds 3600 \
+        --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+        --output text)"
 
-        echo "=============================="
-        echo "Region: ${REGION}"
-        echo "Vault ASG Name tag: ${NAME_TAG}"
-        echo "Bastion: ${BASTION_ID}"
-        echo "SSH key on bastion: ${SSH_KEY_ON_BASTION}"
-        echo "=============================="
+      export AWS_ACCESS_KEY_ID="$(echo "$aws_sts_output" | awk '{print $1}')"
+      export AWS_SECRET_ACCESS_KEY="$(echo "$aws_sts_output" | awk '{print $2}')"
+      export AWS_SESSION_TOKEN="$(echo "$aws_sts_output" | awk '{print $3}')"
 
-        # 1) Get all Vault node private IPs (6 instances)
-        IPS="$(aws ec2 describe-instances \
-          --region "${REGION}" \
-          --filters "Name=tag:Name,Values=${NAME_TAG}" "Name=instance-state-name,Values=running" \
-          --query 'Reservations[].Instances[].PrivateIpAddress' \
-          --output text | tr '\t' ' ')"
+      aws sts get-caller-identity
 
-        if [ -z "${IPS}" ]; then
-          echo "ERROR: No running instances found for Name=${NAME_TAG} in ${REGION}"
-          return 1
-        fi
+      echo "=== [${TARGET}] Discovering Vault nodes by tag Name=${VAULT_NAME_TAG} in ${AWS_REGION} ==="
+      IPS="$(aws ec2 describe-instances \
+        --region "${AWS_REGION}" \
+        --filters "Name=tag:Name,Values=${VAULT_NAME_TAG}" "Name=instance-state-name,Values=running" \
+        --query 'Reservations[].Instances[].PrivateIpAddress' \
+        --output text | tr '\t' ' ')"
 
-        echo "Found node IPs: ${IPS}"
+      if [ -z "${IPS}" ]; then
+        echo "ERROR: No running instances found for Name=${VAULT_NAME_TAG} in ${AWS_REGION}"
+        exit 1
+      fi
 
-        # 2) Build the script that will run *on the bastion*.
-        #    It SSHes into each vault node and checks `HA Mode: active`.
-        cat > run_on_bastion.sh <<'EOS'
+      echo "Found node IPs: ${IPS}"
+      echo "Bastion: ${BASTION_INSTANCE_ID}"
+
+      # Build the script that will run ON the bastion (via SSM).
+      # It loops all vault nodes and finds the leader (HA Mode: active).
+      cat > run_on_bastion.sh <<'EOS'
       set -euo pipefail
 
-      VAULT_SSH_USER="${VAULT_SSH_USER}"
-      SSH_KEY_ON_BASTION="${SSH_KEY_ON_BASTION}"
-      IPS="${IPS}"
-
       echo "=== Running on bastion ==="
-      echo "IPS: ${IPS}"
+      echo "VAULT_SSH_USER=${VAULT_SSH_USER}"
+      echo "SSH_KEY_PATH_ON_BASTION=${SSH_KEY_PATH_ON_BASTION}"
+      echo "IPS=${IPS}"
 
       leader_ip=""
       leader_out=""
@@ -87,19 +96,17 @@ vault-leader-status-primary-and-dr:
       for ip in ${IPS}; do
         echo "---- Checking node ${ip} ----"
 
-        # Run vault status on the node as root (sudo -i),
-        # with VAULT_ADDR + VAULT_CACERT exported (as you validated manually).
-        out="$(ssh -i "${SSH_KEY_ON_BASTION}" \
+        out="$(ssh -i "${SSH_KEY_PATH_ON_BASTION}" \
           -o StrictHostKeyChecking=no \
           -o UserKnownHostsFile=/dev/null \
           "${VAULT_SSH_USER}@${ip}" \
-          "sudo -i bash -lc 'export VAULT_ADDR=https://127.0.0.1:8200; export VAULT_CACERT=/etc/vault.d/tls/ca.pem; vault status'" 2>&1 || true)"
+          "sudo -i bash -lc 'export VAULT_ADDR=${VAULT_ADDR_LOCAL}; export VAULT_CACERT=${VAULT_CACERT_PATH}; vault status'" \
+          2>&1 || true)"
 
         echo "${out}"
 
         mode="$(echo "${out}" | awk -F: '/^HA Mode/ {gsub(/^[ \t]+/, "", $2); print $2; exit}')"
 
-        # Some vault versions print "active" / "standby"
         if [ "${mode}" = "active" ]; then
           leader_ip="${ip}"
           leader_out="${out}"
@@ -118,81 +125,72 @@ vault-leader-status-primary-and-dr:
       echo "${leader_out}"
 EOS
 
-        # Inject vars into the bastion script (no quoting headaches)
-        sed -i "s|^VAULT_SSH_USER=.*|VAULT_SSH_USER=\"${VAULT_SSH_USER}\"|g" run_on_bastion.sh
-        sed -i "s|^SSH_KEY_ON_BASTION=.*|SSH_KEY_ON_BASTION=\"${SSH_KEY_ON_BASTION}\"|g" run_on_bastion.sh
-        sed -i "s|^IPS=.*|IPS=\"${IPS}\"|g" run_on_bastion.sh
+      # Inject values safely (no broken quoting)
+      sed -i "s|^VAULT_SSH_USER=.*|VAULT_SSH_USER=\"${VAULT_SSH_USER}\"|g" run_on_bastion.sh
+      sed -i "s|^SSH_KEY_PATH_ON_BASTION=.*|SSH_KEY_PATH_ON_BASTION=\"${SSH_KEY_PATH_ON_BASTION}\"|g" run_on_bastion.sh
+      sed -i "s|^IPS=.*|IPS=\"${IPS}\"|g" run_on_bastion.sh
+      sed -i "s|^\\s*\"sudo -i bash -lc 'export VAULT_ADDR=.*|          \"sudo -i bash -lc 'export VAULT_ADDR=${VAULT_ADDR_LOCAL}; export VAULT_CACERT=${VAULT_CACERT_PATH}; vault status'\" \\|g" run_on_bastion.sh || true
 
-        # 3) Wrap it into ONE command for SSM (base64 avoids JSON escaping issues)
-        B64="$(base64 -w0 run_on_bastion.sh)"
+      # Base64 to avoid JSON / escaping issues
+      B64="$(base64 -w0 run_on_bastion.sh)"
+      REMOTE_CMD="bash -lc 'echo ${B64} | base64 -d > /tmp/run_on_bastion.sh && chmod +x /tmp/run_on_bastion.sh && /tmp/run_on_bastion.sh'"
 
-        REMOTE_CMD="bash -lc 'echo ${B64} | base64 -d > /tmp/run_on_bastion.sh && chmod +x /tmp/run_on_bastion.sh && /tmp/run_on_bastion.sh'"
-
-        # 4) Create the SSM send-command payload safely using python json
-        python3 - <<PY > ssm-input.json
+      # Create SSM input json (this avoids your "Expected '=', received EOF" / Invalid JSON problems)
+      python3 - <<PY > ssm-input.json
 import json
 payload = {
   "DocumentName": "AWS-RunShellScript",
-  "InstanceIds": ["${BASTION_ID}"],
+  "InstanceIds": ["${BASTION_INSTANCE_ID}"],
   "Parameters": {"commands": ["${REMOTE_CMD}"]},
   "TimeoutSeconds": 600
 }
 print(json.dumps(payload))
 PY
 
-        echo "Sending SSM command..."
-        CMD_ID="$(aws ssm send-command \
-          --region "${REGION}" \
-          --cli-input-json file://ssm-input.json \
-          --query "Command.CommandId" \
+      echo "=== [${TARGET}] Sending SSM command ==="
+      CMD_ID="$(aws ssm send-command \
+        --region "${AWS_REGION}" \
+        --cli-input-json file://ssm-input.json \
+        --query "Command.CommandId" \
+        --output text)"
+
+      echo "CommandId: ${CMD_ID}"
+
+      # Poll status (avoid waiter hard-failing without logs)
+      STATUS="Pending"
+      for i in $(seq 1 60); do
+        STATUS="$(aws ssm list-command-invocations \
+          --region "${AWS_REGION}" \
+          --command-id "${CMD_ID}" \
+          --details \
+          --query "CommandInvocations[0].Status" \
           --output text)"
-
-        echo "CommandId: ${CMD_ID}"
-
-        # IMPORTANT:
-        # `aws ssm wait command-executed` fails the job if status becomes Failed.
-        # We'll poll ourselves and then print stdout/stderr.
-        for i in $(seq 1 60); do
-          STATUS="$(aws ssm list-command-invocations \
-            --region "${REGION}" \
-            --command-id "${CMD_ID}" \
-            --details \
-            --query "CommandInvocations[0].Status" \
-            --output text)"
-          echo "SSM Status: ${STATUS}"
-          if [ "${STATUS}" = "Success" ] || [ "${STATUS}" = "Failed" ] || [ "${STATUS}" = "TimedOut" ] || [ "${STATUS}" = "Cancelled" ]; then
-            break
-          fi
-          sleep 5
-        done
-
-        echo "===== STDOUT (${REGION}) ====="
-        aws ssm get-command-invocation \
-          --region "${REGION}" \
-          --command-id "${CMD_ID}" \
-          --instance-id "${BASTION_ID}" \
-          --query "StandardOutputContent" \
-          --output text || true
-
-        echo "===== STDERR (${REGION}) ====="
-        aws ssm get-command-invocation \
-          --region "${REGION}" \
-          --command-id "${CMD_ID}" \
-          --instance-id "${BASTION_ID}" \
-          --query "StandardErrorContent" \
-          --output text || true
-
-        # Fail pipeline if SSM failed
-        if [ "${STATUS}" != "Success" ]; then
-          echo "ERROR: SSM command ended with status ${STATUS}"
-          return 1
+        echo "SSM Status: ${STATUS}"
+        if [ "${STATUS}" = "Success" ] || [ "${STATUS}" = "Failed" ] || [ "${STATUS}" = "TimedOut" ] || [ "${STATUS}" = "Cancelled" ]; then
+          break
         fi
+        sleep 5
+      done
 
-        echo "✅ ${REGION} leader status fetched successfully."
-      }
+      echo "===== STDOUT (${TARGET}/${AWS_REGION}) ====="
+      aws ssm get-command-invocation \
+        --region "${AWS_REGION}" \
+        --command-id "${CMD_ID}" \
+        --instance-id "${BASTION_INSTANCE_ID}" \
+        --query "StandardOutputContent" \
+        --output text || true
 
-      # Primary: us-west-2 (vaas-staging)
-      run_region "us-west-2" "vaas-staging" "${BASTION_ID_USW2}" "${SSH_KEY_PATH_USW2_ON_BASTION}"
+      echo "===== STDERR (${TARGET}/${AWS_REGION}) ====="
+      aws ssm get-command-invocation \
+        --region "${AWS_REGION}" \
+        --command-id "${CMD_ID}" \
+        --instance-id "${BASTION_INSTANCE_ID}" \
+        --query "StandardErrorContent" \
+        --output text || true
 
-      # DR: us-east-1 (vaas-dev-dr)
-      run_region "us-east-1" "vaas-dev-dr" "${BASTION_ID_USE1}" "${SSH_KEY_PATH_USE1_ON_BASTION}"
+      if [ "${STATUS}" != "Success" ]; then
+        echo "ERROR: SSM command ended with status ${STATUS}"
+        exit 1
+      fi
+
+      echo "✅ [${TARGET}] Leader vault status fetched successfully."
