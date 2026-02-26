@@ -25,9 +25,10 @@ vault-status-staging:
   id_tokens:
     GITLAB_OIDC_TOKEN:
       aud: https://gitlab.corp.zscaler.com
-  script:
+  before_script:
     - set -euo pipefail
-
+    - yum -y install jq >/dev/null 2>&1 || true
+  script:
     # Assume staging role using GitLab OIDC
     - |
       aws_sts_output=$(aws sts assume-role-with-web-identity \
@@ -44,19 +45,36 @@ vault-status-staging:
 
       aws sts get-caller-identity
 
-    # SSM -> bastion -> ssh -> sudo -> export -> vault status
+    # Build REMOTE_CMD (SSM -> bastion -> ssh -> sudo -> export -> vault status)
     - |
-      REMOTE_CMD="sudo -i bash -lc \"ssh -i ${SSH_KEY_PATH_ON_BASTION} \
+      REMOTE_CMD="sudo -i bash -lc 'ssh -i ${SSH_KEY_PATH_ON_BASTION} \
         -o StrictHostKeyChecking=no \
         -o UserKnownHostsFile=/dev/null \
         ubuntu@${VAULT_NODE_IP} \
-        \\\"sudo -i bash -lc 'export VAULT_ADDR=${VAULT_ADDR_LOCAL}; export VAULT_CACERT=${VAULT_CACERT_PATH}; vault status'\\\"\""
+        \"sudo -i bash -lc '\''export VAULT_ADDR=${VAULT_ADDR_LOCAL}; export VAULT_CACERT=${VAULT_CACERT_PATH}; vault status'\''\"'"
 
+      echo "REMOTE_CMD=${REMOTE_CMD}"
+
+    # Create valid JSON input for send-command (NO quoting issues)
+    - |
+      jq -n \
+        --arg region "${AWS_REGION}" \
+        --arg iid "${BASTION_INSTANCE_ID}" \
+        --arg doc "AWS-RunShellScript" \
+        --arg cmd "${REMOTE_CMD}" \
+        '{
+          DocumentName: $doc,
+          InstanceIds: [$iid],
+          Parameters: { commands: [$cmd] }
+        }' > ssm-input.json
+
+      cat ssm-input.json
+
+    # Send SSM command using cli-input-json
+    - |
       CMD_ID=$(aws ssm send-command \
         --region "${AWS_REGION}" \
-        --instance-ids "${BASTION_INSTANCE_ID}" \
-        --document-name "AWS-RunShellScript" \
-        --parameters "{\"commands\":[\"${REMOTE_CMD//\"/\\\"}\"]}" \
+        --cli-input-json file://ssm-input.json \
         --query "Command.CommandId" \
         --output text)
 
