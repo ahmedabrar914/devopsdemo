@@ -10,7 +10,6 @@ stages:
   - status
 
 variables:
-  # Role used by GitLab OIDC to get AWS creds (staging account)
   STAGE_ROLE_ARN: "arn:aws:iam::792014834907:role/gitlab-vaas-iac-role"
   KUBERNETES_POD_LABELS_INTERNET_ALLOW: "internet=allow"
 
@@ -66,7 +65,7 @@ vault-leader-status:
       echo "Caller identity:"
       aws sts get-caller-identity
 
-    # 2) Discover Vault node private IPs by tag (expect 6)
+    # 2) Discover Vault node IPs by tag
     - |
       echo "=== [$TARGET] Discovering Vault nodes (Name=${VAULT_TAG_NAME}) in ${AWS_REGION} ==="
       VAULT_NODE_IPS="$(
@@ -90,86 +89,99 @@ vault-leader-status:
       VAULT_NODE_IPS_ONE_LINE="$(echo "${VAULT_NODE_IPS}" | tr '\n' ' ' | xargs)"
       export VAULT_NODE_IPS_ONE_LINE
 
-    # 3) Build bastion script:
-    #    - run `vault status` on any reachable node
-    #    - read "Active Node Address" and convert to leader IP
-    #    - run `vault status` on leader and print it
+    # 3) Build bastion script safely (NO variable expansion on runner)
     - |
       echo "=== [$TARGET] Building bastion script (leader = Active Node Address) ==="
-      cat > vault_leader_status.sh <<EOF
+
+      cat > vault_leader_status.sh <<'EOF'
       #!/bin/bash
       set -euo pipefail
 
-      echo "Running on bastion: \$(hostname)"
+      VAULT_NODE_IPS_ONE_LINE="__VAULT_NODE_IPS__"
+      SSH_KEY_PATH_ON_BASTION="__SSH_KEY__"
+      SSH_USER="__SSH_USER__"
+      VAULT_ADDR_LOCAL="__VAULT_ADDR__"
+      VAULT_CACERT_PATH="__VAULT_CACERT__"
+
+      echo "Running on bastion: $(hostname)"
       echo "Candidate Vault nodes: ${VAULT_NODE_IPS_ONE_LINE}"
 
       run_status() {
-        local ip="\$1"
+        local ip="$1"
         sudo -i bash -lc "ssh -i ${SSH_KEY_PATH_ON_BASTION} \
           -o StrictHostKeyChecking=no \
           -o UserKnownHostsFile=/dev/null \
-          ${SSH_USER}@\${ip} \
-          \\"sudo -i bash -lc 'export VAULT_ADDR=${VAULT_ADDR_LOCAL}; export VAULT_CACERT=${VAULT_CACERT_PATH}; vault status'\\""
+          ${SSH_USER}@${ip} \
+          \"sudo -i bash -lc 'export VAULT_ADDR=${VAULT_ADDR_LOCAL}; export VAULT_CACERT=${VAULT_CACERT_PATH}; vault status'\""
       }
 
-      # --- Find a seed node that responds ---
+      # 1) Find a seed node that responds
       SEED_OUT=""
       SEED_IP=""
       for ip in ${VAULT_NODE_IPS_ONE_LINE}; do
-        echo "### Probing seed node \${ip} ..."
+        echo "### Probing seed node ${ip} ..."
         set +e
-        out="\$(run_status "\${ip}" 2>&1)"
-        rc=\$?
+        out="$(run_status "${ip}" 2>&1)"
+        rc=$?
         set -e
-        if [ \$rc -eq 0 ]; then
-          SEED_OUT="\${out}"
-          SEED_IP="\${ip}"
+        if [ $rc -eq 0 ]; then
+          SEED_OUT="${out}"
+          SEED_IP="${ip}"
           break
         fi
       done
 
-      if [ -z "\${SEED_OUT}" ]; then
+      if [ -z "${SEED_OUT}" ]; then
         echo "ERROR: Could not run 'vault status' on any node."
         exit 2
       fi
 
-      echo ""
-      echo "Seed node used: \${SEED_IP}"
+      echo "Seed node used: ${SEED_IP}"
 
-      # --- Extract Active Node Address safely (do NOT split on ':') ---
-      ACTIVE_ADDR="\$(
-        echo "\${SEED_OUT}" \
-          | tr -d '\\r' \
-          | sed -n 's/^[[:space:]]*Active Node Address[[:space:]]*:[[:space:]]*//p' \
-          | head -n1
+      # 2) Extract Active Node Address from table output (no colon)
+      # Example line: "Active Node Address    https://ip-10-75-0-126.ec2.internal:8200"
+      ACTIVE_ADDR="$(
+        echo "${SEED_OUT}" \
+          | tr -d '\r' \
+          | awk '$1=="Active" && $2=="Node" && $3=="Address" {print $4; exit}'
       )"
 
-      if [ -z "\${ACTIVE_ADDR}" ]; then
+      if [ -z "${ACTIVE_ADDR}" ]; then
         echo "ERROR: Could not extract 'Active Node Address' from seed output."
         echo "---- seed vault status ----"
-        echo "\${SEED_OUT}"
+        echo "${SEED_OUT}"
         exit 2
       fi
 
-      echo "Active Node Address (leader): \${ACTIVE_ADDR}"
+      echo "Active Node Address (leader): ${ACTIVE_ADDR}"
 
-      # --- Convert leader hostname to leader IP (no DNS needed) ---
-      # Example: https://ip-10-82-0-104.us-west-2.compute.internal:8200
-      ACTIVE_HOST="\$(echo "\${ACTIVE_ADDR}" | sed -E 's|^https?://||; s|:.*$||')"
-      LEADER_IP="\$(echo "\${ACTIVE_HOST}" | sed -n 's/^ip-\\([0-9]\\+\\)-\\([0-9]\\+\\)-\\([0-9]\\+\\)-\\([0-9]\\+\\).*/\\1.\\2.\\3.\\4/p')"
+      # 3) Derive leader IP from hostname (no DNS dependency)
+      # ACTIVE_ADDR => https://ip-10-75-0-126.ec2.internal:8200
+      ACTIVE_HOST="$(echo "${ACTIVE_ADDR}" | sed -E 's|^https?://||; s|:.*$||')"
+      LEADER_IP="$(echo "${ACTIVE_HOST}" | sed -n 's/^ip-\([0-9]\+\)-\([0-9]\+\)-\([0-9]\+\)-\([0-9]\+\).*/\1.\2.\3.\4/p')"
 
-      if [ -z "\${LEADER_IP}" ]; then
-        echo "ERROR: Could not derive leader IP from hostname: \${ACTIVE_HOST}"
+      if [ -z "${LEADER_IP}" ]; then
+        echo "ERROR: Could not derive leader IP from hostname: ${ACTIVE_HOST}"
         exit 2
       fi
 
-      echo "Resolved leader IP: \${LEADER_IP}"
+      echo "Resolved leader IP: ${LEADER_IP}"
 
+      # 4) Run vault status on leader and print
       echo ""
-      echo "==== vault status (LEADER \${LEADER_IP}) ===="
-      LEADER_OUT="\$(run_status "\${LEADER_IP}")"
-      echo "\${LEADER_OUT}"
+      echo "==== vault status (LEADER ${LEADER_IP}) ===="
+      LEADER_OUT="$(run_status "${LEADER_IP}")"
+      echo "${LEADER_OUT}"
       EOF
+
+      # Inject runtime values (runner-side) into placeholders
+      sed -i \
+        -e "s|__VAULT_NODE_IPS__|${VAULT_NODE_IPS_ONE_LINE}|g" \
+        -e "s|__SSH_KEY__|${SSH_KEY_PATH_ON_BASTION}|g" \
+        -e "s|__SSH_USER__|${SSH_USER}|g" \
+        -e "s|__VAULT_ADDR__|${VAULT_ADDR_LOCAL}|g" \
+        -e "s|__VAULT_CACERT__|${VAULT_CACERT_PATH}|g" \
+        vault_leader_status.sh
 
       chmod +x vault_leader_status.sh
       B64_SCRIPT="$(base64 vault_leader_status.sh | tr -d '\n')"
@@ -192,7 +204,7 @@ vault-leader-status:
 
       echo "SSM CommandId: ${CMD_ID}"
 
-    # 5) Wait + print output (show stdout/stderr even if failed)
+    # 5) Wait + print output (always show stdout/stderr)
     - |
       echo "=== [$TARGET] Waiting for SSM execution ==="
       set +e
