@@ -10,6 +10,7 @@ stages:
   - status
 
 variables:
+  # Role used by GitLab OIDC to get AWS creds (staging account)
   STAGE_ROLE_ARN: "arn:aws:iam::792014834907:role/gitlab-vaas-iac-role"
   KUBERNETES_POD_LABELS_INTERNET_ALLOW: "internet=allow"
 
@@ -22,7 +23,7 @@ vault-leader-status:
       - TARGET: "PRIMARY"
         AWS_REGION: "us-west-2"
         VAULT_TAG_NAME: "vaas-staging"
-        BASTION_INSTANCE_ID: "i-PRIMARY_BASTION_ID"
+        BASTION_INSTANCE_ID: "i-035c86b6405b6ab1b"
         SSH_KEY_PATH_ON_BASTION: "/usr/bin/vaas-staging/vault-staging-ssh-key.pem"
         SSH_USER: "ubuntu"
         VAULT_ADDR_LOCAL: "https://127.0.0.1:8200"
@@ -31,7 +32,7 @@ vault-leader-status:
       - TARGET: "DR"
         AWS_REGION: "us-east-1"
         VAULT_TAG_NAME: "vaas-dev-dr"
-        BASTION_INSTANCE_ID: "i-DR_BASTION_ID"
+        BASTION_INSTANCE_ID: "i-076259481ae826b71"
         SSH_KEY_PATH_ON_BASTION: "/usr/bin/vaas-staging/vault-staging-ssh-key.pem"
         SSH_USER: "ubuntu"
         VAULT_ADDR_LOCAL: "https://127.0.0.1:8200"
@@ -62,11 +63,12 @@ vault-leader-status:
       export AWS_SECRET_ACCESS_KEY="$(echo "$aws_sts_output" | awk '{print $2}')"
       export AWS_SESSION_TOKEN="$(echo "$aws_sts_output" | awk '{print $3}')"
 
+      echo "Caller identity:"
       aws sts get-caller-identity
 
-    # 2) Discover Vault node IPs by tag (expect 6)
+    # 2) Discover Vault node private IPs by tag (expect 6)
     - |
-      echo "=== [$TARGET] Discovering Vault nodes (tag Name=${VAULT_TAG_NAME}) in ${AWS_REGION} ==="
+      echo "=== [$TARGET] Discovering Vault nodes (Name=${VAULT_TAG_NAME}) in ${AWS_REGION} ==="
       VAULT_NODE_IPS="$(
         aws ec2 describe-instances \
           --region "${AWS_REGION}" \
@@ -88,9 +90,12 @@ vault-leader-status:
       VAULT_NODE_IPS_ONE_LINE="$(echo "${VAULT_NODE_IPS}" | tr '\n' ' ' | xargs)"
       export VAULT_NODE_IPS_ONE_LINE
 
-    # 3) Build script to run on bastion (SSM)
+    # 3) Build bastion script:
+    #    - run `vault status` on any reachable node
+    #    - read "Active Node Address" and convert to leader IP
+    #    - run `vault status` on leader and print it
     - |
-      echo "=== [$TARGET] Building bastion leader-check script (vault status) ==="
+      echo "=== [$TARGET] Building bastion script (leader = Active Node Address) ==="
       cat > vault_leader_status.sh <<EOF
       #!/bin/bash
       set -euo pipefail
@@ -98,7 +103,6 @@ vault-leader-status:
       echo "Running on bastion: \$(hostname)"
       echo "Candidate Vault nodes: ${VAULT_NODE_IPS_ONE_LINE}"
 
-      # Run vault status on a single node (no token required)
       run_status() {
         local ip="\$1"
         sudo -i bash -lc "ssh -i ${SSH_KEY_PATH_ON_BASTION} \
@@ -108,68 +112,70 @@ vault-leader-status:
           \\"sudo -i bash -lc 'export VAULT_ADDR=${VAULT_ADDR_LOCAL}; export VAULT_CACERT=${VAULT_CACERT_PATH}; vault status'\\""
       }
 
-      LEADER_IP=""
-      LEADER_OUT=""
-      echo "---- Probing nodes for leader (HA Mode: active) ----"
-
+      # --- Find a seed node that responds ---
+      SEED_OUT=""
+      SEED_IP=""
       for ip in ${VAULT_NODE_IPS_ONE_LINE}; do
-        echo ""
-        echo "### Checking \${ip} ..."
+        echo "### Probing seed node \${ip} ..."
         set +e
         out="\$(run_status "\${ip}" 2>&1)"
         rc=\$?
         set -e
-
-        if [ \$rc -ne 0 ]; then
-          echo "WARN: vault status failed on \${ip} (rc=\${rc})"
-          echo "\${out}"
-          continue
-        fi
-
-        # show quick summary line
-        ha_mode="\$(echo "\${out}" | awk -F: '/^HA Mode/ {gsub(/^[ \t]+|[ \t]+$/, "", \$2); print \$2; exit}')"
-        active_addr="\$(echo "\${out}" | awk -F: '/^Active Node Address/ {gsub(/^[ \t]+|[ \t]+$/, "", \$2); print \$2; exit}')"
-        echo "HA Mode=\${ha_mode:-unknown} ActiveNode=\${active_addr:-n/a}"
-
-        # Leader detection (matches your working output)
-        if echo "\${out}" | grep -Eiq '^HA Mode[[:space:]]*:[[:space:]]*active\\b'; then
-          LEADER_IP="\${ip}"
-          LEADER_OUT="\${out}"
+        if [ \$rc -eq 0 ]; then
+          SEED_OUT="\${out}"
+          SEED_IP="\${ip}"
           break
         fi
       done
 
-      echo ""
-      echo "==== RESULT ===="
-      if [ -n "\${LEADER_IP}" ]; then
-        echo "Leader (active) node: \${LEADER_IP}"
-        echo "---- vault status (leader) ----"
-        echo "\${LEADER_OUT}"
-        exit 0
+      if [ -z "\${SEED_OUT}" ]; then
+        echo "ERROR: Could not run 'vault status' on any node."
+        exit 2
       fi
 
-      echo "ERROR: No active leader found in node list."
-      echo "Dumping active-node hints from nodes that responded:"
-      for ip in ${VAULT_NODE_IPS_ONE_LINE}; do
-        set +e
-        out="\$(run_status "\${ip}" 2>/dev/null)"
-        rc=\$?
-        set -e
-        if [ \$rc -eq 0 ]; then
-          hint="\$(echo "\${out}" | awk -F: '/^Active Node Address/ {gsub(/^[ \t]+|[ \t]+$/, "", \$2); print \$2; exit}')"
-          mode="\$(echo "\${out}" | awk -F: '/^HA Mode/ {gsub(/^[ \t]+|[ \t]+$/, "", \$2); print \$2; exit}')"
-          echo "\${ip}: HA=\${mode:-?} ActiveNode=\${hint:-?}"
-        fi
-      done
+      echo ""
+      echo "Seed node used: \${SEED_IP}"
 
-      exit 2
+      # --- Extract Active Node Address safely (do NOT split on ':') ---
+      ACTIVE_ADDR="\$(
+        echo "\${SEED_OUT}" \
+          | tr -d '\\r' \
+          | sed -n 's/^[[:space:]]*Active Node Address[[:space:]]*:[[:space:]]*//p' \
+          | head -n1
+      )"
+
+      if [ -z "\${ACTIVE_ADDR}" ]; then
+        echo "ERROR: Could not extract 'Active Node Address' from seed output."
+        echo "---- seed vault status ----"
+        echo "\${SEED_OUT}"
+        exit 2
+      fi
+
+      echo "Active Node Address (leader): \${ACTIVE_ADDR}"
+
+      # --- Convert leader hostname to leader IP (no DNS needed) ---
+      # Example: https://ip-10-82-0-104.us-west-2.compute.internal:8200
+      ACTIVE_HOST="\$(echo "\${ACTIVE_ADDR}" | sed -E 's|^https?://||; s|:.*$||')"
+      LEADER_IP="\$(echo "\${ACTIVE_HOST}" | sed -n 's/^ip-\\([0-9]\\+\\)-\\([0-9]\\+\\)-\\([0-9]\\+\\)-\\([0-9]\\+\\).*/\\1.\\2.\\3.\\4/p')"
+
+      if [ -z "\${LEADER_IP}" ]; then
+        echo "ERROR: Could not derive leader IP from hostname: \${ACTIVE_HOST}"
+        exit 2
+      fi
+
+      echo "Resolved leader IP: \${LEADER_IP}"
+
+      echo ""
+      echo "==== vault status (LEADER \${LEADER_IP}) ===="
+      LEADER_OUT="\$(run_status "\${LEADER_IP}")"
+      echo "\${LEADER_OUT}"
       EOF
 
       chmod +x vault_leader_status.sh
       B64_SCRIPT="$(base64 vault_leader_status.sh | tr -d '\n')"
       export B64_SCRIPT
 
-    # 4) Send to bastion via SSM + print output
+    # 4) Send to bastion via SSM
     - |
       echo "=== [$TARGET] Sending SSM command to ${BASTION_INSTANCE_ID} in ${AWS_REGION} ==="
       CMD_ID="$(aws ssm send-command \
@@ -183,8 +189,10 @@ vault-leader-status:
         ]" \
         --query "Command.CommandId" \
         --output text)"
+
       echo "SSM CommandId: ${CMD_ID}"
 
+    # 5) Wait + print output (show stdout/stderr even if failed)
     - |
       echo "=== [$TARGET] Waiting for SSM execution ==="
       set +e
