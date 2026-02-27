@@ -89,7 +89,10 @@ vault-leader-status:
       VAULT_NODE_IPS_ONE_LINE="$(echo "${VAULT_NODE_IPS}" | tr '\n' ' ' | xargs)"
       export VAULT_NODE_IPS_ONE_LINE
 
-    # 3) Build bastion script safely (NO variable expansion on runner)
+    # 3) Build bastion script:
+    #    - run vault status on first reachable node
+    #    - read "Active Node Address" as the leader
+    #    - if Active Node Address is missing (when seed itself is leader), fall back to seed IP
     - |
       echo "=== [$TARGET] Building bastion script (leader = Active Node Address) ==="
 
@@ -138,43 +141,44 @@ vault-leader-status:
 
       echo "Seed node used: ${SEED_IP}"
 
-      # 2) Extract Active Node Address from table output (no colon)
-      # Example line: "Active Node Address    https://ip-10-75-0-126.ec2.internal:8200"
+      # 2) Extract Active Node Address from table output (NO HA mode check)
+      # Format: "Active Node Address    https://ip-10-xx-xx-xx....:8200"
       ACTIVE_ADDR="$(
         echo "${SEED_OUT}" \
           | tr -d '\r' \
           | awk '$1=="Active" && $2=="Node" && $3=="Address" {print $4; exit}'
       )"
 
-      if [ -z "${ACTIVE_ADDR}" ]; then
-        echo "ERROR: Could not extract 'Active Node Address' from seed output."
-        echo "---- seed vault status ----"
-        echo "${SEED_OUT}"
-        exit 2
-      fi
+      LEADER_IP=""
 
-      echo "Active Node Address (leader): ${ACTIVE_ADDR}"
+      if [ -n "${ACTIVE_ADDR}" ]; then
+        echo "Active Node Address (leader): ${ACTIVE_ADDR}"
 
-      # 3) Derive leader IP from hostname (no DNS dependency)
-      # ACTIVE_ADDR => https://ip-10-75-0-126.ec2.internal:8200
-      ACTIVE_HOST="$(echo "${ACTIVE_ADDR}" | sed -E 's|^https?://||; s|:.*$||')"
-      LEADER_IP="$(echo "${ACTIVE_HOST}" | sed -n 's/^ip-\([0-9]\+\)-\([0-9]\+\)-\([0-9]\+\)-\([0-9]\+\).*/\1.\2.\3.\4/p')"
+        # Derive leader IP from hostname (no DNS dependency)
+        ACTIVE_HOST="$(echo "${ACTIVE_ADDR}" | sed -E 's|^https?://||; s|:.*$||')"
+        LEADER_IP="$(echo "${ACTIVE_HOST}" | sed -n 's/^ip-\([0-9]\+\)-\([0-9]\+\)-\([0-9]\+\)-\([0-9]\+\).*/\1.\2.\3.\4/p')"
 
-      if [ -z "${LEADER_IP}" ]; then
-        echo "ERROR: Could not derive leader IP from hostname: ${ACTIVE_HOST}"
-        exit 2
+        if [ -z "${LEADER_IP}" ]; then
+          echo "ERROR: Could not derive leader IP from hostname: ${ACTIVE_HOST}"
+          exit 2
+        fi
+      else
+        # If Active Node Address is not present (often on the leader itself),
+        # treat the seed node as the leader.
+        echo "WARN: 'Active Node Address' not present on seed output; using seed as leader."
+        LEADER_IP="${SEED_IP}"
       fi
 
       echo "Resolved leader IP: ${LEADER_IP}"
 
-      # 4) Run vault status on leader and print
+      # 3) Run vault status on leader and print
       echo ""
       echo "==== vault status (LEADER ${LEADER_IP}) ===="
       LEADER_OUT="$(run_status "${LEADER_IP}")"
       echo "${LEADER_OUT}"
       EOF
 
-      # Inject runtime values (runner-side) into placeholders
+      # Inject runtime values into placeholders
       sed -i \
         -e "s|__VAULT_NODE_IPS__|${VAULT_NODE_IPS_ONE_LINE}|g" \
         -e "s|__SSH_KEY__|${SSH_KEY_PATH_ON_BASTION}|g" \
