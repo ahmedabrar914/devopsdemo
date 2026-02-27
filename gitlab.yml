@@ -43,7 +43,7 @@ vault-leader-status:
 
   before_script:
     - set -euo pipefail
-    - yum -y install bash coreutils jq >/dev/null 2>&1 || true
+    - yum -y install bash coreutils >/dev/null 2>&1 || true
     - aws --version
 
   script:
@@ -64,9 +64,9 @@ vault-leader-status:
 
       aws sts get-caller-identity
 
-    # 2) Discover all Vault node private IPs by tag (expect 6)
+    # 2) Discover Vault node IPs by tag (expect 6)
     - |
-      echo "=== [$TARGET] Discovering Vault instances (Name=${VAULT_TAG_NAME}) in ${AWS_REGION} ==="
+      echo "=== [$TARGET] Discovering Vault nodes (tag Name=${VAULT_TAG_NAME}) in ${AWS_REGION} ==="
       VAULT_NODE_IPS="$(
         aws ec2 describe-instances \
           --region "${AWS_REGION}" \
@@ -78,101 +78,92 @@ vault-leader-status:
       )"
 
       if [ -z "${VAULT_NODE_IPS}" ]; then
-        echo "ERROR: No running instances found for tag Name=${VAULT_TAG_NAME} in ${AWS_REGION}"
+        echo "ERROR: No running instances found for Name=${VAULT_TAG_NAME} in ${AWS_REGION}"
         exit 1
       fi
 
       echo "Discovered node IPs:"
       echo "${VAULT_NODE_IPS}"
 
-      # Make a single-line, space-separated list to embed safely
       VAULT_NODE_IPS_ONE_LINE="$(echo "${VAULT_NODE_IPS}" | tr '\n' ' ' | xargs)"
       export VAULT_NODE_IPS_ONE_LINE
 
-    # 3) Build script to run ON THE BASTION:
-    #    - loops through 6 nodes
-    #    - runs `vault status`
-    #    - detects leader by "HA Mode.*active"
-    #    - prints leader status and exits 0
-    #    - if none active, prints all statuses summary and exits 2
+    # 3) Build script to run on bastion (SSM)
     - |
-      echo "=== [$TARGET] Building bastion leader-check script ==="
-      cat > vault_leader_status.sh <<'EOF'
+      echo "=== [$TARGET] Building bastion leader-check script (vault status) ==="
+      cat > vault_leader_status.sh <<EOF
       #!/bin/bash
       set -euo pipefail
 
-      echo "Running on bastion: $(hostname)"
+      echo "Running on bastion: \$(hostname)"
       echo "Candidate Vault nodes: ${VAULT_NODE_IPS_ONE_LINE}"
 
-      is_active() {
-        # return 0 if active leader, else 1
-        # Works for typical `vault status` output where HA Mode is "active"/"standby"
-        grep -Eiq '^HA Mode\s*:\s*active\b' || grep -Eiq '^HA Mode\s+active\b'
-      }
-
+      # Run vault status on a single node (no token required)
       run_status() {
-        local ip="$1"
-
-        # Run vault status on the vault node (no token needed)
+        local ip="\$1"
         sudo -i bash -lc "ssh -i ${SSH_KEY_PATH_ON_BASTION} \
           -o StrictHostKeyChecking=no \
           -o UserKnownHostsFile=/dev/null \
-          ${SSH_USER}@${ip} \
-          \"sudo -i bash -lc 'export VAULT_ADDR=${VAULT_ADDR_LOCAL}; export VAULT_CACERT=${VAULT_CACERT_PATH}; vault status'\""
+          ${SSH_USER}@\${ip} \
+          \\"sudo -i bash -lc 'export VAULT_ADDR=${VAULT_ADDR_LOCAL}; export VAULT_CACERT=${VAULT_CACERT_PATH}; vault status'\\""
       }
 
       LEADER_IP=""
       LEADER_OUT=""
+      echo "---- Probing nodes for leader (HA Mode: active) ----"
 
-      echo "---- Probing nodes for leader ----"
       for ip in ${VAULT_NODE_IPS_ONE_LINE}; do
         echo ""
-        echo "### Checking ${ip} ..."
+        echo "### Checking \${ip} ..."
         set +e
-        out="$(run_status "${ip}" 2>&1)"
-        rc=$?
+        out="\$(run_status "\${ip}" 2>&1)"
+        rc=\$?
         set -e
 
-        if [ $rc -ne 0 ]; then
-          echo "WARN: vault status failed on ${ip} (rc=${rc})"
-          echo "${out}"
+        if [ \$rc -ne 0 ]; then
+          echo "WARN: vault status failed on \${ip} (rc=\${rc})"
+          echo "\${out}"
           continue
         fi
 
-        # Print short info line always
-        ha_mode="$(echo "${out}" | awk -F: '/^HA Mode/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}')"
-        active_addr="$(echo "${out}" | awk -F: '/^Active Node Address/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}')"
-        echo "HA Mode=${ha_mode:-unknown} ActiveNode=${active_addr:-n/a}"
+        # show quick summary line
+        ha_mode="\$(echo "\${out}" | awk -F: '/^HA Mode/ {gsub(/^[ \t]+|[ \t]+$/, "", \$2); print \$2; exit}')"
+        active_addr="\$(echo "\${out}" | awk -F: '/^Active Node Address/ {gsub(/^[ \t]+|[ \t]+$/, "", \$2); print \$2; exit}')"
+        echo "HA Mode=\${ha_mode:-unknown} ActiveNode=\${active_addr:-n/a}"
 
-        if echo "${out}" | is_active; then
-          LEADER_IP="${ip}"
-          LEADER_OUT="${out}"
+        # Leader detection (matches your working output)
+        if echo "\${out}" | grep -Eiq '^HA Mode[[:space:]]*:[[:space:]]*active\\b'; then
+          LEADER_IP="\${ip}"
+          LEADER_OUT="\${out}"
           break
         fi
       done
 
       echo ""
       echo "==== RESULT ===="
-      if [ -n "${LEADER_IP}" ]; then
-        echo "Leader (active) node: ${LEADER_IP}"
+      if [ -n "\${LEADER_IP}" ]; then
+        echo "Leader (active) node: \${LEADER_IP}"
         echo "---- vault status (leader) ----"
-        echo "${LEADER_OUT}"
+        echo "\${LEADER_OUT}"
         exit 0
       fi
 
       echo "ERROR: No active leader found in node list."
-      echo "Tip: If cluster is down or sealed, `vault status` will not show HA Mode active."
+      echo "Dumping active-node hints from nodes that responded:"
+      for ip in ${VAULT_NODE_IPS_ONE_LINE}; do
+        set +e
+        out="\$(run_status "\${ip}" 2>/dev/null)"
+        rc=\$?
+        set -e
+        if [ \$rc -eq 0 ]; then
+          hint="\$(echo "\${out}" | awk -F: '/^Active Node Address/ {gsub(/^[ \t]+|[ \t]+$/, "", \$2); print \$2; exit}')"
+          mode="\$(echo "\${out}" | awk -F: '/^HA Mode/ {gsub(/^[ \t]+|[ \t]+$/, "", \$2); print \$2; exit}')"
+          echo "\${ip}: HA=\${mode:-?} ActiveNode=\${hint:-?}"
+        fi
+      done
+
       exit 2
       EOF
-
-      # inject runner-side vars into the script safely (simple env substitution)
-      sed -i \
-        -e "s|\${VAULT_NODE_IPS_ONE_LINE}|${VAULT_NODE_IPS_ONE_LINE}|g" \
-        -e "s|\${SSH_KEY_PATH_ON_BASTION}|${SSH_KEY_PATH_ON_BASTION}|g" \
-        -e "s|\${SSH_USER}|${SSH_USER}|g" \
-        -e "s|\${VAULT_ADDR_LOCAL}|${VAULT_ADDR_LOCAL}|g" \
-        -e "s|\${VAULT_CACERT_PATH}|${VAULT_CACERT_PATH}|g" \
-        vault_leader_status.sh
 
       chmod +x vault_leader_status.sh
       B64_SCRIPT="$(base64 vault_leader_status.sh | tr -d '\n')"
@@ -180,7 +171,7 @@ vault-leader-status:
 
     # 4) Send to bastion via SSM + print output
     - |
-      echo "=== [$TARGET] Sending SSM command to bastion ${BASTION_INSTANCE_ID} (${AWS_REGION}) ==="
+      echo "=== [$TARGET] Sending SSM command to ${BASTION_INSTANCE_ID} in ${AWS_REGION} ==="
       CMD_ID="$(aws ssm send-command \
         --region "${AWS_REGION}" \
         --instance-ids "${BASTION_INSTANCE_ID}" \
