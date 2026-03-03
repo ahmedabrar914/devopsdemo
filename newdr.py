@@ -1,0 +1,226 @@
+import os
+import json
+import time
+import boto3
+import urllib3
+from urllib3.util.retry import Retry
+
+# ----------------------------
+# Required env vars
+# ----------------------------
+PRIMARY_ADDR = os.environ["VAULT_PRIMARY_ADDR"]          # https://usw2.dev.vault.corp.zscaler.com:8200
+SECONDARY_ADDR = os.environ["VAULT_SECONDARY_ADDR"]      # https://use1.dev.vault.corp.zscaler.com:8200
+
+PRIMARY_TOKEN = os.environ["VAULT_PRIMARY_TOKEN"]        # root token (for now)
+SECONDARY_TOKEN = os.environ["VAULT_SECONDARY_TOKEN"]    # root token (for now)
+
+PRIMARY_CLUSTER_ID = os.environ.get("VAULT_PRIMARY_CLUSTER_ID", "usw2")
+
+VAULT_CA_SECRET_ID = os.environ["VAULT_CA_SECRET_ID"]    # secret name or ARN
+VAULT_CA_SECRET_JSON_KEY = os.environ.get("VAULT_CA_SECRET_JSON_KEY")  # e.g. "ca_pem" if JSON secret
+
+POST_ENABLE_SLEEP_SECONDS = int(os.environ.get("POST_ENABLE_SLEEP_SECONDS", "8"))
+
+CA_PATH = "/tmp/vault-ca.pem"
+
+secrets = boto3.client("secretsmanager")
+
+
+# ----------------------------
+# CA handling (Secrets Manager -> /tmp)
+# ----------------------------
+def load_ca_to_tmp() -> str:
+    resp = secrets.get_secret_value(SecretId=VAULT_CA_SECRET_ID)
+
+    if "SecretString" in resp and resp["SecretString"]:
+        secret_val = resp["SecretString"]
+    else:
+        secret_val = resp["SecretBinary"].decode("utf-8")
+
+    if VAULT_CA_SECRET_JSON_KEY:
+        try:
+            obj = json.loads(secret_val)
+        except json.JSONDecodeError:
+            raise Exception("CA secret expected JSON but is not valid JSON")
+
+        pem = obj.get(VAULT_CA_SECRET_JSON_KEY)
+    else:
+        pem = secret_val
+
+    if not pem or "BEGIN CERTIFICATE" not in pem:
+        raise Exception("CA PEM not found/invalid in Secrets Manager secret")
+
+    with open(CA_PATH, "w", encoding="utf-8") as f:
+        f.write(pem)
+
+    return CA_PATH
+
+
+# ----------------------------
+# HTTP client (urllib3)
+# ----------------------------
+def build_http(ca_file_path: str):
+    retries = Retry(
+        total=3,
+        backoff_factor=0.6,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"],
+        raise_on_status=False,
+    )
+    return urllib3.PoolManager(
+        retries=retries,
+        cert_reqs="CERT_REQUIRED",
+        ca_certs=ca_file_path,
+    )
+
+
+def _parse_json(resp):
+    if not resp.data:
+        return {}
+    txt = resp.data.decode("utf-8", errors="replace").strip()
+    if not txt:
+        return {}
+    return json.loads(txt)
+
+
+def vault_get(http, addr: str, token: str, path: str):
+    url = f"{addr.rstrip('/')}/v1/{path.lstrip('/')}"
+    headers = {"X-Vault-Token": token}
+    resp = http.request("GET", url, headers=headers, timeout=urllib3.Timeout(connect=5, read=20))
+    return resp.status, _parse_json(resp)
+
+
+def vault_post(http, addr: str, token: str, path: str, payload: dict | None = None):
+    url = f"{addr.rstrip('/')}/v1/{path.lstrip('/')}"
+    headers = {"X-Vault-Token": token, "Content-Type": "application/json"}
+    body = json.dumps(payload or {}).encode("utf-8")
+    resp = http.request("POST", url, headers=headers, body=body, timeout=urllib3.Timeout(connect=5, read=40))
+    return resp.status, _parse_json(resp)
+
+
+def require_ok(step: str, status: int, data: dict, ok=(200, 204)):
+    if status in ok:
+        return
+    raise Exception(json.dumps({
+        "step": step,
+        "http_status": status,
+        "vault_errors": data.get("errors"),
+        "response": data
+    }, default=str))
+
+
+# ----------------------------
+# DR replication steps (match your PDF)
+# ----------------------------
+def enable_dr_primary(http):
+    # Step 1: vault write -force sys/replication/dr/primary/enable
+    st, data = vault_post(http, PRIMARY_ADDR, PRIMARY_TOKEN, "sys/replication/dr/primary/enable", payload={})
+    require_ok("step1_enable_dr_primary", st, data, ok=(200, 204))
+
+    # Vault can briefly be unavailable
+    time.sleep(POST_ENABLE_SLEEP_SECONDS)
+    return {"http": st, "warnings_or_response": data}
+
+
+def generate_secondary_public_key(http):
+    # Step 2: vault write -f sys/replication/dr/secondary/generate-public-key
+    st, data = vault_post(http, SECONDARY_ADDR, SECONDARY_TOKEN, "sys/replication/dr/secondary/generate-public-key", payload={})
+    require_ok("step2_generate_secondary_public_key", st, data, ok=(200, 204))
+
+    pub = (data.get("data") or {}).get("secondary_public_key")
+    if not pub:
+        raise Exception(json.dumps({"step": "step2_generate_secondary_public_key", "error": "secondary_public_key missing", "response": data}))
+    return pub
+
+
+def generate_activation_token(http, secondary_public_key: str):
+    # Step 3: vault write sys/replication/dr/primary/secondary-token secondary_public_key=<...> id=<...>
+    payload = {"secondary_public_key": secondary_public_key, "id": PRIMARY_CLUSTER_ID}
+    st, data = vault_post(http, PRIMARY_ADDR, PRIMARY_TOKEN, "sys/replication/dr/primary/secondary-token", payload=payload)
+    require_ok("step3_generate_activation_token", st, data, ok=(200, 204))
+
+    tok = (data.get("data") or {}).get("token")
+    if not tok:
+        raise Exception(json.dumps({"step": "step3_generate_activation_token", "error": "token missing", "response": data}))
+    return tok
+
+
+def enable_dr_secondary(http, activation_token: str):
+    # Step 4: vault write sys/replication/dr/secondary/enable token=<...>
+    payload = {"token": activation_token}
+    st, data = vault_post(http, SECONDARY_ADDR, SECONDARY_TOKEN, "sys/replication/dr/secondary/enable", payload=payload)
+    require_ok("step4_enable_dr_secondary", st, data, ok=(200, 204))
+    return {"http": st, "warnings_or_response": data}
+
+
+def replication_status(http):
+    # Validate: vault read sys/replication/status
+    st_a, data_a = vault_get(http, PRIMARY_ADDR, PRIMARY_TOKEN, "sys/replication/status")
+    st_b, data_b = vault_get(http, SECONDARY_ADDR, SECONDARY_TOKEN, "sys/replication/status")
+
+    def summarize(which: str, st: int, data: dict):
+        d = data.get("data") or {}
+        dr = d.get("dr") or {}
+        return {
+            f"{which}_http": st,
+            f"{which}_dr_mode": dr.get("mode"),
+            f"{which}_dr_state": dr.get("state"),
+            f"{which}_primary_cluster_addr": dr.get("primary_cluster_addr"),
+            f"{which}_known_secondaries": dr.get("known_secondaries"),
+            f"{which}_cluster_id": dr.get("cluster_id"),
+        }
+
+    out = {}
+    out.update(summarize("primary", st_a, data_a))
+    out.update(summarize("secondary", st_b, data_b))
+    return out
+
+
+# ----------------------------
+# Lambda handler
+# ----------------------------
+def lambda_handler(event, context):
+    """
+    Optional event controls:
+      {"validate_only": true} -> only reads replication status
+      {"dry_run": true}       -> does nothing
+    """
+    if event.get("dry_run"):
+        return {"statusCode": 200, "message": "dry_run=true, not executing"}
+
+    ca_file = load_ca_to_tmp()
+    http = build_http(ca_file)
+
+    if event.get("validate_only"):
+        return {"statusCode": 200, **replication_status(http)}
+
+    # Step 1
+    step1 = enable_dr_primary(http)
+
+    # Step 2
+    pub = generate_secondary_public_key(http)
+
+    # Step 3
+    act_token = generate_activation_token(http, pub)
+
+    # Step 4
+    step4 = enable_dr_secondary(http, act_token)
+
+    # Validate
+    validate = replication_status(http)
+
+    # Return key-value output (no escaped JSON)
+    return {
+        "statusCode": 200,
+
+        "primary_addr": PRIMARY_ADDR,
+        "secondary_addr": SECONDARY_ADDR,
+        "primary_cluster_id_used": PRIMARY_CLUSTER_ID,
+
+        "step1_enable_primary_http": step1["http"],
+        "step2_secondary_public_key_prefix": pub[:12] + "...",
+        "step3_activation_token_prefix": act_token[:12] + "...",
+        "step4_enable_secondary_http": step4["http"],
+
+        **validate,
+    }
