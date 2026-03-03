@@ -4,7 +4,6 @@ import time
 import boto3
 import urllib3
 from urllib3.util.retry import Retry
-from typing import Optional, Dict, Any, Tuple
 
 # ----------------------------
 # Required env vars
@@ -23,6 +22,7 @@ VAULT_CA_SECRET_JSON_KEY = os.environ.get("VAULT_CA_SECRET_JSON_KEY")  # e.g. "c
 POST_ENABLE_SLEEP_SECONDS = int(os.environ.get("POST_ENABLE_SLEEP_SECONDS", "8"))
 
 CA_PATH = "/tmp/vault-ca.pem"
+
 secrets = boto3.client("secretsmanager")
 
 
@@ -59,7 +59,7 @@ def load_ca_to_tmp() -> str:
 # ----------------------------
 # HTTP client (urllib3)
 # ----------------------------
-def build_http(ca_file_path: str) -> urllib3.PoolManager:
+def build_http(ca_file_path: str):
     retries = Retry(
         total=3,
         backoff_factor=0.6,
@@ -74,7 +74,7 @@ def build_http(ca_file_path: str) -> urllib3.PoolManager:
     )
 
 
-def _parse_json(resp) -> Dict[str, Any]:
+def _parse_json(resp):
     if not resp.data:
         return {}
     txt = resp.data.decode("utf-8", errors="replace").strip()
@@ -83,28 +83,21 @@ def _parse_json(resp) -> Dict[str, Any]:
     return json.loads(txt)
 
 
-def vault_get(http: urllib3.PoolManager, addr: str, token: str, path: str) -> Tuple[int, Dict[str, Any]]:
-    url = f"{addr.rstrip('/')}/v1/{path.lstrip('/')}"
-    headers = {"X-Vault-Token": token}
-    resp = http.request("GET", url, headers=headers, timeout=urllib3.Timeout(connect=5, read=20))
-    return resp.status, _parse_json(resp)
-
-
-def vault_post(
-    http: urllib3.PoolManager,
-    addr: str,
-    token: str,
-    path: str,
-    payload: Optional[Dict[str, Any]] = None
-) -> Tuple[int, Dict[str, Any]]:
+def vault_post(http, addr: str, token: str, path: str, payload=None):
     url = f"{addr.rstrip('/')}/v1/{path.lstrip('/')}"
     headers = {"X-Vault-Token": token, "Content-Type": "application/json"}
     body = json.dumps(payload or {}).encode("utf-8")
-    resp = http.request("POST", url, headers=headers, body=body, timeout=urllib3.Timeout(connect=5, read=40))
+    resp = http.request(
+        "POST",
+        url,
+        headers=headers,
+        body=body,
+        timeout=urllib3.Timeout(connect=5, read=40),
+    )
     return resp.status, _parse_json(resp)
 
 
-def require_ok(step: str, status: int, data: Dict[str, Any], ok=(200, 204)) -> None:
+def require_ok(step: str, status: int, data: dict, ok=(200, 204)):
     if status in ok:
         return
     raise Exception(json.dumps({
@@ -118,16 +111,21 @@ def require_ok(step: str, status: int, data: Dict[str, Any], ok=(200, 204)) -> N
 # ----------------------------
 # DR replication steps (match your PDF)
 # ----------------------------
-def enable_dr_primary(http: urllib3.PoolManager) -> Dict[str, Any]:
-    st, data = vault_post(http, PRIMARY_ADDR, PRIMARY_TOKEN, "sys/replication/dr/primary/enable", payload={})
-    require_ok("step1_enable_dr_primary", st, data)
+def enable_dr_primary(http):
+    # Step 1
+    st, data = vault_post(http, PRIMARY_ADDR, PRIMARY_TOKEN,
+                          "sys/replication/dr/primary/enable", payload={})
+    require_ok("step1_enable_dr_primary", st, data, ok=(200, 204))
+
     time.sleep(POST_ENABLE_SLEEP_SECONDS)
     return {"http": st, "warnings_or_response": data}
 
 
-def generate_secondary_public_key(http: urllib3.PoolManager) -> str:
-    st, data = vault_post(http, SECONDARY_ADDR, SECONDARY_TOKEN, "sys/replication/dr/secondary/generate-public-key", payload={})
-    require_ok("step2_generate_secondary_public_key", st, data)
+def generate_secondary_public_key(http):
+    # Step 2
+    st, data = vault_post(http, SECONDARY_ADDR, SECONDARY_TOKEN,
+                          "sys/replication/dr/secondary/generate-public-key", payload={})
+    require_ok("step2_generate_secondary_public_key", st, data, ok=(200, 204))
 
     pub = (data.get("data") or {}).get("secondary_public_key")
     if not pub:
@@ -135,14 +133,16 @@ def generate_secondary_public_key(http: urllib3.PoolManager) -> str:
             "step": "step2_generate_secondary_public_key",
             "error": "secondary_public_key missing",
             "response": data
-        }, default=str))
+        }))
     return pub
 
 
-def generate_activation_token(http: urllib3.PoolManager, secondary_public_key: str) -> str:
+def generate_activation_token(http, secondary_public_key: str):
+    # Step 3
     payload = {"secondary_public_key": secondary_public_key, "id": PRIMARY_CLUSTER_ID}
-    st, data = vault_post(http, PRIMARY_ADDR, PRIMARY_TOKEN, "sys/replication/dr/primary/secondary-token", payload=payload)
-    require_ok("step3_generate_activation_token", st, data)
+    st, data = vault_post(http, PRIMARY_ADDR, PRIMARY_TOKEN,
+                          "sys/replication/dr/primary/secondary-token", payload=payload)
+    require_ok("step3_generate_activation_token", st, data, ok=(200, 204))
 
     tok = (data.get("data") or {}).get("token")
     if not tok:
@@ -150,56 +150,34 @@ def generate_activation_token(http: urllib3.PoolManager, secondary_public_key: s
             "step": "step3_generate_activation_token",
             "error": "token missing",
             "response": data
-        }, default=str))
+        }))
     return tok
 
 
-def enable_dr_secondary(http: urllib3.PoolManager, activation_token: str) -> Dict[str, Any]:
+def enable_dr_secondary(http, activation_token: str):
+    # Step 4
     payload = {"token": activation_token}
-    st, data = vault_post(http, SECONDARY_ADDR, SECONDARY_TOKEN, "sys/replication/dr/secondary/enable", payload=payload)
-    require_ok("step4_enable_dr_secondary", st, data)
+    st, data = vault_post(http, SECONDARY_ADDR, SECONDARY_TOKEN,
+                          "sys/replication/dr/secondary/enable", payload=payload)
+    require_ok("step4_enable_dr_secondary", st, data, ok=(200, 204))
     return {"http": st, "warnings_or_response": data}
 
 
 # ----------------------------
-# Status check ONLY on primary cluster (Cluster A)
-# ----------------------------
-def replication_status_primary_only(http: urllib3.PoolManager) -> Dict[str, Any]:
-    st, data = vault_get(http, PRIMARY_ADDR, PRIMARY_TOKEN, "sys/replication/status")
-
-    d = (data.get("data") or {})
-    dr = (d.get("dr") or {})
-
-    return {
-        "primary_http": st,
-        "primary_dr_mode": dr.get("mode"),
-        "primary_dr_state": dr.get("state"),
-        "primary_primary_cluster_addr": dr.get("primary_cluster_addr"),
-        "primary_known_secondaries": dr.get("known_secondaries"),
-        "primary_cluster_id": dr.get("cluster_id"),
-    }
-
-
-# ----------------------------
-# Entry function called by handler
+# Entry function (called by handler)
 # ----------------------------
 def run_enable_replication(event, context):
     """
-    Optional event controls:
-      {"dry_run": true} -> does nothing
-      {"validate_only": true} -> checks status ONLY on primary cluster
+    {"dry_run": true} -> does nothing
     """
     event = event or {}
 
-    try:
-        if event.get("dry_run"):
-            return {"statusCode": 200, "message": "dry_run=true, not executing"}
+    if event.get("dry_run"):
+        return {"statusCode": 200, "message": "dry_run=true, not executing"}
 
+    try:
         ca_file = load_ca_to_tmp()
         http = build_http(ca_file)
-
-        if event.get("validate_only"):
-            return {"statusCode": 200, **replication_status_primary_only(http)}
 
         # Step 1
         step1 = enable_dr_primary(http)
@@ -213,9 +191,6 @@ def run_enable_replication(event, context):
         # Step 4
         step4 = enable_dr_secondary(http, act_token)
 
-        # Validate ONLY on primary
-        validate = replication_status_primary_only(http)
-
         return {
             "statusCode": 200,
             "primary_addr": PRIMARY_ADDR,
@@ -225,10 +200,9 @@ def run_enable_replication(event, context):
             "step2_secondary_public_key_prefix": pub[:12] + "...",
             "step3_activation_token_prefix": act_token[:12] + "...",
             "step4_enable_secondary_http": step4["http"],
-            **validate,
-            "next_action": "MANUAL: Restart Vault on DR (Cluster B) nodes as per runbook. Optionally re-run validate_only=true (primary-only)."
+            "next_action": "Restart Vault on DR (Cluster B) nodes manually as per runbook."
         }
 
     except Exception as e:
-        # Stops execution immediately if any step fails
+        # Stops immediately if any step fails
         return {"statusCode": 500, "error": str(e)}
