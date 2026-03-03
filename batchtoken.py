@@ -2,133 +2,126 @@ import os
 import json
 import datetime
 import boto3
-import urllib3
+import requests
+from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ----------------------------
-# Env
+# Config (env vars)
 # ----------------------------
-PRIMARY_ADDR = os.environ["VAULT_PRIMARY_ADDR"]
-
+VAULT_ADDR = os.environ["VAULT_PRIMARY_ADDR"].rstrip("/")
 VAULT_CA_SECRET_ID = os.environ["VAULT_CA_SECRET_ID"]
-VAULT_CA_SECRET_JSON_KEY = os.environ.get("VAULT_CA_SECRET_JSON_KEY")  # e.g. ca_pem
+VAULT_CA_SECRET_JSON_KEY = os.environ.get("VAULT_CA_SECRET_JSON_KEY")  # e.g. "ca_pem" if JSON secret
 
 VAULT_ROOT_TOKEN_SECRET_ID = os.environ["VAULT_ROOT_TOKEN_SECRET_ID"]
-VAULT_ROOT_TOKEN_JSON_KEY = os.environ.get("VAULT_ROOT_TOKEN_JSON_KEY")  # e.g. token (if JSON secret)
+VAULT_ROOT_TOKEN_JSON_KEY = os.environ.get("VAULT_ROOT_TOKEN_JSON_KEY", "token")  # JSON key for root token
 
 ROTATED_TOKEN_SECRET_ID = os.environ["ROTATED_TOKEN_SECRET_ID"]
 BATCH_TOKEN_TTL = os.environ.get("BATCH_TOKEN_TTL", "24h")
 
-CA_PATH = "/tmp/vault-ca.pem"
-
+# Names from your PDF
 POLICY_NAME = "dr-secondary-promotion"
 ROLE_NAME = "failover-handler"
+
+# File path in Lambda writable dir
+CA_PATH = "/tmp/vault-ca.pem"
 
 secrets = boto3.client("secretsmanager")
 
 
 # ----------------------------
-# Secrets helpers
+# Helpers: AWS Secrets
 # ----------------------------
-def read_secret_string(secret_id: str) -> str:
+def get_secret_value(secret_id: str) -> str:
     resp = secrets.get_secret_value(SecretId=secret_id)
-    if "SecretString" in resp and resp["SecretString"]:
+    if "SecretString" in resp and resp["SecretString"] is not None:
         return resp["SecretString"]
+    # binary secret fallback
     return resp["SecretBinary"].decode("utf-8")
 
 
+def load_root_token() -> str:
+    raw = get_secret_value(VAULT_ROOT_TOKEN_SECRET_ID)
+
+    # If it's JSON: {"token": "..."}
+    try:
+        obj = json.loads(raw)
+        tok = obj.get(VAULT_ROOT_TOKEN_JSON_KEY)
+        if not tok:
+            raise Exception(f"Root token JSON missing key '{VAULT_ROOT_TOKEN_JSON_KEY}'")
+        return tok
+    except json.JSONDecodeError:
+        # If you stored the token as plaintext (not recommended), just return it
+        return raw.strip()
+
+
 def load_ca_to_tmp() -> str:
-    secret_val = read_secret_string(VAULT_CA_SECRET_ID)
-    if VAULT_CA_SECRET_JSON_KEY:
-        obj = json.loads(secret_val)
+    raw = get_secret_value(VAULT_CA_SECRET_ID)
+
+    # If CA stored as JSON, extract key; otherwise treat as PEM plaintext
+    pem = None
+    try:
+        obj = json.loads(raw)
+        if not VAULT_CA_SECRET_JSON_KEY:
+            raise Exception("CA secret is JSON but VAULT_CA_SECRET_JSON_KEY not set")
         pem = obj.get(VAULT_CA_SECRET_JSON_KEY)
-    else:
-        pem = secret_val
+        if not pem:
+            raise Exception(f"CA JSON missing key '{VAULT_CA_SECRET_JSON_KEY}'")
+    except json.JSONDecodeError:
+        pem = raw
 
-    if not pem or "BEGIN CERTIFICATE" not in pem:
-        raise Exception("Invalid CA PEM in CA secret")
-
-    with open(CA_PATH, "w", encoding="utf-8") as f:
+    pem = pem.strip() + "\n"
+    with open(CA_PATH, "w") as f:
         f.write(pem)
 
     return CA_PATH
 
 
-def get_root_token() -> str:
-    secret_val = read_secret_string(VAULT_ROOT_TOKEN_SECRET_ID)
-    if VAULT_ROOT_TOKEN_JSON_KEY:
-        obj = json.loads(secret_val)
-        tok = obj.get(VAULT_ROOT_TOKEN_JSON_KEY)
-    else:
-        tok = secret_val.strip()
-
-    if not tok or len(tok) < 10:
-        raise Exception("Invalid root/admin token in root token secret")
-
-    return tok.strip()
-
-
 # ----------------------------
-# HTTP + Vault API helpers
+# Helpers: HTTP client to Vault
 # ----------------------------
-def build_http(ca_file_path: str):
+def build_http(verify_path: str) -> requests.Session:
+    s = requests.Session()
     retries = Retry(
         total=3,
-        backoff_factor=0.6,
+        backoff_factor=0.5,
         status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET", "POST", "PUT", "LIST"],
+        allowed_methods=["GET", "POST", "PUT", "DELETE"],
         raise_on_status=False,
     )
-    return urllib3.PoolManager(retries=retries, cert_reqs="CERT_REQUIRED", ca_certs=ca_file_path)
+    s.mount("https://", HTTPAdapter(max_retries=retries))
+    s.verify = verify_path
+    s.headers.update({"Content-Type": "application/json"})
+    return s
 
 
-def _parse_json(resp):
-    if not resp.data:
-        return {}
-    txt = resp.data.decode("utf-8", errors="replace").strip()
-    return json.loads(txt) if txt else {}
-
-
-def vault_req(http, method: str, token: str, path: str, payload: dict | None = None):
-    url = f"{PRIMARY_ADDR.rstrip('/')}/v1/{path.lstrip('/')}"
+def vault_req(http: requests.Session, method: str, path: str, token: str, body: dict | None = None):
+    url = f"{VAULT_ADDR}/v1/{path.lstrip('/')}"
     headers = {"X-Vault-Token": token}
-
-    body = None
-    if payload is not None:
-        headers["Content-Type"] = "application/json"
-        body = json.dumps(payload).encode("utf-8")
-
-    resp = http.request(method, url, headers=headers, body=body, timeout=urllib3.Timeout(connect=5, read=30))
-    return resp.status, _parse_json(resp)
+    resp = http.request(method, url, headers=headers, data=json.dumps(body) if body else None, timeout=10)
+    try:
+        data = resp.json() if resp.text else {}
+    except Exception:
+        data = {"raw": resp.text}
+    return resp.status_code, data
 
 
-def require_ok(step: str, status: int, data: dict, ok=(200, 204)):
-    if status in ok:
+def require_ok(step: str, status: int, data: dict):
+    if 200 <= status < 300:
         return
+    errs = data.get("errors")
     raise Exception(json.dumps({
         "step": step,
         "http_status": status,
-        "vault_errors": data.get("errors"),
+        "vault_errors": errs,
         "response": data
-    }, default=str))
+    }))
 
 
 # ----------------------------
-# Policy & Role existence checks
+# Step 1: Ensure policy exists
 # ----------------------------
-def policy_exists(http, token: str) -> bool:
-    # LIST sys/policies/acl returns {"data":{"keys":[...]}}
-    st, data = vault_req(http, "LIST", token, "sys/policies/acl")
-    if st not in (200, 204):
-        # Some envs block LIST; fallback: try read the policy directly
-        st2, data2 = vault_req(http, "GET", token, f"sys/policies/acl/{POLICY_NAME}")
-        return st2 == 200 and (data2.get("data") is not None)
-    keys = (data.get("data") or {}).get("keys") or []
-    return POLICY_NAME in keys
-
-
-def ensure_policy(http, token: str):
-    policy_hcl = """
+POLICY_HCL = r'''
 path "sys/replication/dr/secondary/promote" {
   capabilities = ["update"]
 }
@@ -137,105 +130,162 @@ path "sys/replication/dr/secondary/update-primary" {
   capabilities = ["update"]
 }
 
-# Only if using integrated storage (raft)
+# Only if using integrated storage (raft) as the storage backend
 path "sys/storage/raft/autopilot/state" {
   capabilities = ["update", "read"]
 }
-""".strip()
+'''.strip() + "\n"
 
-    st, data = vault_req(http, "PUT", token, f"sys/policies/acl/{POLICY_NAME}", {"policy": policy_hcl})
-    require_ok("ensure_policy", st, data)
+
+def policy_exists(http: requests.Session, token: str, name: str) -> bool:
+    # GET /v1/sys/policy/<name> returns policy if exists
+    st, data = vault_req(http, "GET", f"sys/policy/{name}", token)
+    if st == 200 and "data" in data:
+        return True
+    if st == 404:
+        return False
+    # any other error -> fail
+    require_ok("policy_exists", st, data)
+    return False
+
+
+def create_policy(http: requests.Session, token: str, name: str) -> int:
+    # PUT /v1/sys/policy/<name> with {"policy": "..."}
+    st, data = vault_req(http, "PUT", f"sys/policy/{name}", token, {"policy": POLICY_HCL})
+    require_ok("create_policy", st, data)
     return st
 
 
-def role_exists(http, token: str) -> bool:
-    # Try read role: GET auth/token/roles/<role>
-    st, data = vault_req(http, "GET", token, f"auth/token/roles/{ROLE_NAME}")
-    return st == 200 and (data.get("data") is not None)
+# ----------------------------
+# Step 2: Ensure token role exists
+# ----------------------------
+def role_exists(http: requests.Session, token: str, name: str) -> bool:
+    st, data = vault_req(http, "GET", f"auth/token/roles/{name}", token)
+    if st == 200 and "data" in data:
+        return True
+    if st == 404:
+        return False
+    require_ok("role_exists", st, data)
+    return False
 
 
-def ensure_role(http, token: str):
+def create_role(http: requests.Session, token: str, name: str) -> int:
+    # Matches your manual:
+    # vault write auth/token/roles/failover-handler \
+    #   allowed_policies=dr-secondary-promotion \
+    #   orphan=true \
+    #   renewable=false \
+    #   token_type=batch
     payload = {
         "allowed_policies": POLICY_NAME,
         "orphan": True,
         "renewable": False,
-        "token_type": "batch"
+        "token_type": "batch",
+        # Keep default policy included (manual output includes "default")
+        # If you wanted to remove it, set: "token_no_default_policy": True
     }
-    st, data = vault_req(http, "POST", token, f"auth/token/roles/{ROLE_NAME}", payload)
-    require_ok("ensure_role", st, data)
+    st, data = vault_req(http, "POST", f"auth/token/roles/{name}", token, payload)
+    require_ok("create_role", st, data)
     return st
 
 
 # ----------------------------
-# Create batch token + store
+# Step 3: Create batch token (manual-equivalent)
 # ----------------------------
-def create_batch_token(http, token: str):
-    payload = {"role_name": ROLE_NAME, "ttl": BATCH_TOKEN_TTL}
-    st, data = vault_req(http, "POST", token, "auth/token/create", payload)
+def create_batch_token(http: requests.Session, token: str, role_name: str, ttl: str):
+    # Manual equivalent:
+    # vault token create -role=failover-handler -ttl=24h
+    #
+    # Correct API call:
+    # POST /v1/auth/token/create/<role_name> with {"ttl":"24h"}
+    st, data = vault_req(http, "POST", f"auth/token/create/{role_name}", token, {"ttl": ttl})
     require_ok("create_batch_token", st, data)
 
     auth = data.get("auth") or {}
     client_token = auth.get("client_token")
-    accessor = auth.get("accessor")
+    accessor = auth.get("accessor")  # batch token often shows "n/a" in CLI; API may give "" or omit
     ttl_seconds = auth.get("lease_duration")
+    policies = auth.get("policies") or []
 
     if not client_token:
         raise Exception(json.dumps({"step": "create_batch_token", "error": "client_token missing", "response": data}))
-    return client_token, accessor, ttl_seconds
 
+    # Convert TTL string like "24h" to "token_duration" same as CLI output
+    token_duration = ttl  # keep exactly as configured (like manual shows 24h)
 
-def store_rotated_token(token: str, accessor: str | None, ttl_seconds: int | None):
-    now = datetime.datetime.utcnow().isoformat() + "Z"
-    payload = {
-        "token": token,
-        "ttl": BATCH_TOKEN_TTL,
-        "ttl_seconds": ttl_seconds,
-        "accessor": accessor,
-        "created_at": now
+    # CLI shows token_accessor as "n/a" for batch token. Force that format.
+    token_accessor_cli = "n/a"
+
+    # created_at in Zulu
+    created_at = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+    return {
+        "token": client_token,
+        "token_accessor": token_accessor_cli,
+        "token_duration": token_duration,
+        "token_duration_seconds": ttl_seconds,
+        "token_renewable": False,  # batch tokens are not renewable (and your role sets renewable=false)
+        "token_policies": policies,
+        "identity_policies": auth.get("identity_policies") or [],
+        "policies": policies,
+        "created_at": created_at,
+        "role_name": role_name,
+        "vault_addr": VAULT_ADDR,
     }
+
+
+def store_rotated_token(payload: dict):
     secrets.put_secret_value(
         SecretId=ROTATED_TOKEN_SECRET_ID,
         SecretString=json.dumps(payload)
     )
-    return payload
 
 
+# ----------------------------
+# Lambda handler
+# ----------------------------
 def lambda_handler(event, context):
-    ca_file = load_ca_to_tmp()
-    http = build_http(ca_file)
+    # 1) Load TLS CA + root token
+    ca_path = load_ca_to_tmp()
+    root_token = load_root_token()
 
-    root_token = get_root_token()
+    http = build_http(ca_path)
 
-    # Policy check -> create if missing
-    policy_was_present = policy_exists(http, root_token)
-    policy_http = None
-    if not policy_was_present:
-        policy_http = ensure_policy(http, root_token)
+    result = {
+        "vault_primary_addr": VAULT_ADDR,
+        "policy_name": POLICY_NAME,
+        "role_name": ROLE_NAME,
+        "batch_token_ttl": BATCH_TOKEN_TTL,
+    }
 
-    # Role check -> create if missing
-    role_was_present = role_exists(http, root_token)
-    role_http = None
-    if not role_was_present:
-        role_http = ensure_role(http, root_token)
+    # 2) Ensure policy exists (create if missing)
+    pol_exists = policy_exists(http, root_token, POLICY_NAME)
+    result["policy_existed"] = pol_exists
+    if not pol_exists:
+        result["policy_create_http"] = create_policy(http, root_token, POLICY_NAME)
+    else:
+        result["policy_create_http"] = None
 
-    # Always rotate token
-    batch_token, accessor, ttl_seconds = create_batch_token(http, root_token)
-    stored = store_rotated_token(batch_token, accessor, ttl_seconds)
+    # 3) Ensure role exists (create if missing)
+    r_exists = role_exists(http, root_token, ROLE_NAME)
+    result["role_existed"] = r_exists
+    if not r_exists:
+        result["role_create_http"] = create_role(http, root_token, ROLE_NAME)
+    else:
+        result["role_create_http"] = None
+
+    # 4) Create batch token using role endpoint (manual-equivalent)
+    token_payload = create_batch_token(http, root_token, ROLE_NAME, BATCH_TOKEN_TTL)
+
+    # 5) Store in Secrets Manager in “manual-like” key/value style
+    store_rotated_token(token_payload)
+
+    # For console output
+    result["token_stored_in_secret"] = ROTATED_TOKEN_SECRET_ID
+    result["created_at"] = token_payload["created_at"]
+    result["token_prefix"] = token_payload["token"].split(".", 1)[0] + "."  # should be "hvb."
 
     return {
         "statusCode": 200,
-        "vault_primary_addr": PRIMARY_ADDR,
-
-        "policy_name": POLICY_NAME,
-        "policy_existed": policy_was_present,
-        "policy_create_http": policy_http,
-
-        "role_name": ROLE_NAME,
-        "role_existed": role_was_present,
-        "role_create_http": role_http,
-
-        "batch_token_ttl": BATCH_TOKEN_TTL,
-        "token_stored_in_secret": ROTATED_TOKEN_SECRET_ID,
-        "token_prefix": batch_token[:12] + "...",
-        "created_at": stored["created_at"]
+        "body": json.dumps(result)
     }
