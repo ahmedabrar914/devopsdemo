@@ -1,3 +1,36 @@
+# enable_replication.py
+# (your imports + your code exactly the same…)
+
+def run_enable_replication(event, context):
+    # same body as your current lambda_handler
+    # just rename the function
+    if event.get("dry_run"):
+        return {"statusCode": 200, "message": "dry_run=true, not executing"}
+
+    ca_file = load_ca_to_tmp()
+    http = build_http(ca_file)
+
+    if event.get("validate_only"):
+        return {"statusCode": 200, **replication_status(http)}
+
+    step1 = enable_dr_primary(http)
+    pub = generate_secondary_public_key(http)
+    act_token = generate_activation_token(http, pub)
+    step4 = enable_dr_secondary(http, act_token)
+    validate = replication_status(http)
+
+    return {
+        "statusCode": 200,
+        "primary_addr": PRIMARY_ADDR,
+        "secondary_addr": SECONDARY_ADDR,
+        "primary_cluster_id_used": PRIMARY_CLUSTER_ID,
+        "step1_enable_primary_http": step1["http"],
+        "step2_secondary_public_key_prefix": pub[:12] + "...",
+        "step3_activation_token_prefix": act_token[:12] + "...",
+        "step4_enable_secondary_http": step4["http"],
+        **validate,
+    }
+
 import os
 import json
 import time
