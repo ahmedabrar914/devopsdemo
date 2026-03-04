@@ -1,91 +1,72 @@
-# re_establish_dr_safer.py
-import os
-import json
-import time
-import random
-import ssl
-import boto3
-import urllib3
+# re_establish_dr_clusterA_token_everywhere.py
+import os, json, time, random, ssl
+import boto3, urllib3
 from urllib3.util.retry import Retry
 
 secrets = boto3.client("secretsmanager")
 
-PRIMARY_ADDR = os.environ["VAULT_PRIMARY_ADDR"]      # Cluster A
-SECONDARY_ADDR = os.environ["VAULT_SECONDARY_ADDR"]  # Cluster B
+A_ADDR = os.environ["VAULT_PRIMARY_ADDR"]          # Cluster A
+B_ADDR = os.environ["VAULT_SECONDARY_ADDR"]        # Cluster B
+B_ID   = os.environ["VAULT_SECONDARY_CLUSTER_ID"]  # PDF Step-2 id=<cluster-b-region>
 
-# Per your doc note: use Cluster A token to auth against Cluster B after promotion
-PRIMARY_TOKEN = os.environ["VAULT_PRIMARY_TOKEN"]
+# ✅ Use Cluster-A token everywhere (equivalent to "export VAULT_TOKEN=..." on both)
+CLUSTER_A_TOKEN = os.environ["VAULT_CLUSTER_A_TOKEN"]
 
-# PDF Step-2 uses id=<cluster-b-region>
-SECONDARY_CLUSTER_ID = os.environ["VAULT_SECONDARY_CLUSTER_ID"]
+# DR operation/batch token for step-3
+DR_OP_SECRET_ID = os.environ["FAILOVER_TOKEN_SECRET_ID"]
+DR_OP_JSON_KEY  = os.environ.get("FAILOVER_TOKEN_JSON_KEY", "token")
 
-FAILOVER_TOKEN_SECRET_ID = os.environ["FAILOVER_TOKEN_SECRET_ID"]
-FAILOVER_TOKEN_JSON_KEY = os.environ.get("FAILOVER_TOKEN_JSON_KEY", "token")
+# CA cert secrets
+A_CA_SECRET_ID = os.environ["VAULT_PRIMARY_CA_SECRET_ID"]
+B_CA_SECRET_ID = os.environ["VAULT_SECONDARY_CA_SECRET_ID"]
+CA_JSON_KEY    = os.environ.get("VAULT_CA_SECRET_JSON_KEY")  # optional
 
-PRIMARY_CA_SECRET_ID = os.environ["VAULT_PRIMARY_CA_SECRET_ID"]
-SECONDARY_CA_SECRET_ID = os.environ["VAULT_SECONDARY_CA_SECRET_ID"]
-VAULT_CA_SECRET_JSON_KEY = os.environ.get("VAULT_CA_SECRET_JSON_KEY")  # optional
+A_CA_PATH = "/tmp/vault-a-ca.pem"
+B_CA_PATH = "/tmp/vault-b-ca.pem"
 
-# Wait controls (you asked: 2 to 5 sec between steps)
-MIN_STEP_SLEEP = int(os.environ.get("MIN_STEP_SLEEP_SECONDS", "2"))
-MAX_STEP_SLEEP = int(os.environ.get("MAX_STEP_SLEEP_SECONDS", "5"))
-
-# Post-update sleep (keep, but you can tune)
-POST_UPDATE_SLEEP_SECONDS = int(os.environ.get("POST_UPDATE_SLEEP_SECONDS", "6"))
-
-PRIMARY_CA_PATH = "/tmp/vault-primary-ca.pem"
-SECONDARY_CA_PATH = "/tmp/vault-secondary-ca.pem"
+MIN_SLEEP = int(os.environ.get("MIN_STEP_SLEEP_SECONDS", "2"))
+MAX_SLEEP = int(os.environ.get("MAX_STEP_SLEEP_SECONDS", "5"))
+POST_UPDATE_SLEEP = int(os.environ.get("POST_UPDATE_SLEEP_SECONDS", "6"))
 
 
-def _step_sleep(label: str):
-    s = random.randint(MIN_STEP_SLEEP, MAX_STEP_SLEEP)
-    print(f"[wait] {label}: sleeping {s}s")
+def _sleep(label: str):
+    s = random.randint(MIN_SLEEP, MAX_SLEEP)
+    print(f"[wait] {label}: {s}s")
     time.sleep(s)
 
-
 def _load_secret_string(secret_id: str) -> str:
-    resp = secrets.get_secret_value(SecretId=secret_id)
-    if resp.get("SecretString"):
-        return resp["SecretString"]
-    return resp["SecretBinary"].decode("utf-8")
+    r = secrets.get_secret_value(SecretId=secret_id)
+    return r["SecretString"] if r.get("SecretString") else r["SecretBinary"].decode("utf-8")
 
-
-def _load_ca_to_tmp(secret_id: str, out_path: str) -> str:
-    secret_val = _load_secret_string(secret_id).strip()
-
-    if VAULT_CA_SECRET_JSON_KEY:
-        try:
-            obj = json.loads(secret_val)
-        except json.JSONDecodeError as e:
-            raise Exception(f"CA secret {secret_id} is not valid JSON but VAULT_CA_SECRET_JSON_KEY is set: {e}")
-        pem = obj.get(VAULT_CA_SECRET_JSON_KEY)
-    else:
-        pem = secret_val
-
+def _write_ca(secret_id: str, out_path: str):
+    raw = _load_secret_string(secret_id).strip()
+    pem = raw
+    if CA_JSON_KEY:
+        pem = json.loads(raw).get(CA_JSON_KEY)
     if not pem or "BEGIN CERTIFICATE" not in pem:
         raise Exception(f"CA PEM invalid/missing in secret: {secret_id}")
-
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(pem)
-    return out_path
 
+def _get_dr_op_token() -> str:
+    raw = _load_secret_string(DR_OP_SECRET_ID).strip()
+    if raw.startswith("{"):
+        tok = (json.loads(raw).get(DR_OP_JSON_KEY) or "").strip()
+        if not tok:
+            raise Exception(f"'{DR_OP_JSON_KEY}' missing in {DR_OP_SECRET_ID}")
+        return tok
+    return raw
 
-def build_http(ca_file_path: str):
+def build_http(ca_path: str):
     retries = Retry(
-        total=3,
-        backoff_factor=0.6,
+        total=3, backoff_factor=0.6,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET", "POST"],
         raise_on_status=False,
     )
-    return urllib3.PoolManager(
-        retries=retries,
-        cert_reqs=ssl.CERT_REQUIRED,   # safer than "CERT_REQUIRED" string
-        ca_certs=ca_file_path,
-    )
+    return urllib3.PoolManager(retries=retries, cert_reqs=ssl.CERT_REQUIRED, ca_certs=ca_path)
 
-
-def _parse_json(resp):
+def _parse(resp):
     if not resp.data:
         return {}
     txt = resp.data.decode("utf-8", errors="replace").strip()
@@ -94,168 +75,103 @@ def _parse_json(resp):
     try:
         return json.loads(txt)
     except json.JSONDecodeError:
-        # Vault sometimes returns non-JSON bodies through proxies/errors; keep body for debugging
         return {"raw": txt}
 
-
-def vault_get(http, addr: str, token: str, path: str):
+def vget(http, addr, path):
     url = f"{addr.rstrip('/')}/v1/{path.lstrip('/')}"
-    headers = {"X-Vault-Token": token}
-    resp = http.request("GET", url, headers=headers, timeout=urllib3.Timeout(connect=5, read=20))
-    return resp.status, _parse_json(resp)
+    hdr = {"X-Vault-Token": CLUSTER_A_TOKEN}
+    r = http.request("GET", url, headers=hdr, timeout=urllib3.Timeout(connect=5, read=25))
+    return r.status, _parse(r)
 
-
-def vault_post(http, addr: str, token: str, path: str, payload=None):
+def vpost(http, addr, path, payload=None):
     url = f"{addr.rstrip('/')}/v1/{path.lstrip('/')}"
-    headers = {"X-Vault-Token": token, "Content-Type": "application/json"}
+    hdr = {"X-Vault-Token": CLUSTER_A_TOKEN, "Content-Type": "application/json"}
     body = json.dumps(payload or {}).encode("utf-8")
-    resp = http.request("POST", url, headers=headers, body=body, timeout=urllib3.Timeout(connect=5, read=40))
-    return resp.status, _parse_json(resp)
+    r = http.request("POST", url, headers=hdr, body=body, timeout=urllib3.Timeout(connect=5, read=45))
+    return r.status, _parse(r)
 
-
-def _looks_sealed(status: int, data: dict) -> bool:
-    if status == 503:
-        errs = data.get("errors") or []
-        joined = " ".join(errs).lower() if isinstance(errs, list) else str(errs).lower()
-        if "sealed" in joined:
-            return True
-    return False
-
-
-def require_ok(step: str, status: int, data: dict, ok=(200, 204)):
-    if status in ok:
+def require_ok(step, st, data, ok=(200, 204)):
+    if st in ok:
         return
-    if _looks_sealed(status, data):
-        raise Exception(json.dumps({
-            "step": step,
-            "http_status": status,
-            "error": "Vault is sealed (expected during some DR transitions). Manual restart/unseal may be required, then rerun.",
-            "vault_errors": data.get("errors"),
-            "response": data,
-        }, default=str))
     raise Exception(json.dumps({
         "step": step,
-        "http_status": status,
+        "http_status": st,
         "vault_errors": data.get("errors"),
         "response": data
     }, default=str))
 
+def dr_status(http, addr):
+    st, d = vget(http, addr, "sys/replication/dr/status")
+    mode = (d.get("data") or {}).get("mode")
+    state = (d.get("data") or {}).get("state")
+    return {"http": st, "mode": mode, "state": state, "raw": d}
 
-def dr_status(http, addr: str, token: str):
-    st, data = vault_get(http, addr, token, "sys/replication/dr/status")
-    return {"http": st, "data": data}
-
-
-def _get_batch_token() -> str:
-    """
-    Supports BOTH:
-      - JSON secret: {"token": "..."} (or FAILOVER_TOKEN_JSON_KEY)
-      - Plain string secret: "s.xxxxx"
-    """
-    raw = _load_secret_string(FAILOVER_TOKEN_SECRET_ID).strip()
-
-    # If it's JSON, extract key; otherwise treat as token string
-    if raw.startswith("{"):
-        obj = json.loads(raw)
-        tok = obj.get(FAILOVER_TOKEN_JSON_KEY)
-        if not tok:
-            raise Exception(f"Batch token key '{FAILOVER_TOKEN_JSON_KEY}' not found in secret {FAILOVER_TOKEN_SECRET_ID}")
-        return tok.strip()
-
-    # plain token
-    return raw
-
-
-def run_re_establish_dr(event, context):
-    """
-    PDF p51–52 flow:
-      PRE: demote Cluster A
-      1) generate-public-key on A
-      2) secondary-token on B (id = cluster-b-region)
-      3) update-primary on A (batch token + activation token)
-      4) verify dr status on both
-    """
+def lambda_handler(event, context):
     event = event or {}
-
     if event.get("dry_run"):
         return {"statusCode": 200, "message": "dry_run=true, not executing"}
 
-    _load_ca_to_tmp(PRIMARY_CA_SECRET_ID, PRIMARY_CA_PATH)
-    _load_ca_to_tmp(SECONDARY_CA_SECRET_ID, SECONDARY_CA_PATH)
-
-    http_a = build_http(PRIMARY_CA_PATH)
-    http_b = build_http(SECONDARY_CA_PATH)
+    _write_ca(A_CA_SECRET_ID, A_CA_PATH)
+    _write_ca(B_CA_SECRET_ID, B_CA_PATH)
+    http_a = build_http(A_CA_PATH)
+    http_b = build_http(B_CA_PATH)
 
     if event.get("validate_only"):
-        return {
-            "statusCode": 200,
-            "mode": "re_establish_dr",
-            "cluster_a_dr_status": dr_status(http_a, PRIMARY_ADDR, PRIMARY_TOKEN),
-            "cluster_b_dr_status": dr_status(http_b, SECONDARY_ADDR, PRIMARY_TOKEN),
-        }
+        return {"statusCode": 200, "a": dr_status(http_a, A_ADDR), "b": dr_status(http_b, B_ADDR)}
 
     steps = {}
 
-    # PRE STEP: demote Cluster A
-    st0, d0 = vault_post(http_a, PRIMARY_ADDR, PRIMARY_TOKEN, "sys/replication/dr/primary/demote", payload={})
-    require_ok("p51_pre_demote_cluster_a", st0, d0)
-    steps["p51_pre_demote_cluster_a"] = {"http": st0, "response": d0}
-    _step_sleep("after_demote")
+    # Precheck: if A already secondary, do NOT demote (your earlier failure)
+    a_stat = dr_status(http_a, A_ADDR)
+    steps["precheck_a_status"] = a_stat
 
-    # Step 1: generate-public-key on Cluster A
-    st1, d1 = vault_post(http_a, PRIMARY_ADDR, PRIMARY_TOKEN, "sys/replication/dr/secondary/generate-public-key", payload={})
+    if a_stat["http"] == 200 and a_stat["mode"] == "primary":
+        st0, d0 = vpost(http_a, A_ADDR, "sys/replication/dr/primary/demote", {})
+        require_ok("p51_pre_demote_cluster_a", st0, d0)
+        steps["p51_pre_demote_cluster_a"] = {"skipped": False, "http": st0}
+        _sleep("after_demote")
+    else:
+        steps["p51_pre_demote_cluster_a"] = {"skipped": True, "reason": f"a_mode={a_stat['mode']}"}
+
+    # Step 1 (PDF p51): generate public key on A
+    st1, d1 = vpost(http_a, A_ADDR, "sys/replication/dr/secondary/generate-public-key", {})
     require_ok("p51_step1_generate_public_key", st1, d1)
-
     pub = (d1.get("data") or {}).get("secondary_public_key")
     if not pub:
-        raise Exception(json.dumps({
-            "step": "p51_step1_generate_public_key",
-            "error": "secondary_public_key missing",
-            "response": d1
-        }))
+        raise Exception(json.dumps({"step": "p51_step1_generate_public_key", "error": "secondary_public_key missing", "response": d1}))
     steps["p51_step1_generate_public_key"] = {"http": st1, "secondary_public_key_prefix": pub[:12] + "..."}
-    _step_sleep("after_generate_public_key")
+    _sleep("after_public_key")
 
-    # Step 2: secondary-token on Cluster B (using Cluster A token per your note)
-    st2, d2 = vault_post(
-        http_b,
-        SECONDARY_ADDR,
-        PRIMARY_TOKEN,
+    # Step 2 (PDF p51): activation token on B (still using Cluster-A token by your requirement)
+    st2, d2 = vpost(
+        http_b, B_ADDR,
         "sys/replication/dr/primary/secondary-token",
-        payload={"secondary_public_key": pub, "id": SECONDARY_CLUSTER_ID},
+        {"secondary_public_key": pub, "id": B_ID},
     )
-    require_ok("p52_step2_generate_activation_token", st2, d2)
-
+    require_ok("p51_step2_generate_activation_token_on_b", st2, d2)
     activation = (d2.get("data") or {}).get("token")
     if not activation:
-        raise Exception(json.dumps({
-            "step": "p52_step2_generate_activation_token",
-            "error": "token missing",
-            "response": d2
-        }))
-    steps["p52_step2_generate_activation_token"] = {"http": st2, "activation_token_prefix": activation[:12] + "..."}
-    _step_sleep("after_activation_token")
+        raise Exception(json.dumps({"step": "p51_step2_generate_activation_token_on_b", "error": "token missing", "response": d2}))
+    steps["p51_step2_generate_activation_token_on_b"] = {"http": st2, "activation_token_prefix": activation[:12] + "..."}
+    _sleep("after_activation_token")
 
-    # Step 3: update-primary on Cluster A
-    batch_token = _get_batch_token()
-    st3, d3 = vault_post(
-        http_a,
-        PRIMARY_ADDR,
-        PRIMARY_TOKEN,
+    # Step 3 (PDF p52): update-primary on A using dr_operation_token + activation token
+    dr_op = _get_dr_op_token()
+    st3, d3 = vpost(
+        http_a, A_ADDR,
         "sys/replication/dr/secondary/update-primary",
-        payload={"dr_operation_token": batch_token, "token": activation},
+        {"dr_operation_token": dr_op, "token": activation},
     )
-    require_ok("p52_step3_update_primary", st3, d3)
-    steps["p52_step3_update_primary"] = {"http": st3, "response": d3}
+    require_ok("p52_step3_update_primary_on_a", st3, d3)
+    steps["p52_step3_update_primary_on_a"] = {"http": st3, "response": d3}
 
-    print(f"[wait] post_update: sleeping {POST_UPDATE_SLEEP_SECONDS}s")
-    time.sleep(POST_UPDATE_SLEEP_SECONDS)
-    _step_sleep("after_post_update_sleep")
+    time.sleep(POST_UPDATE_SLEEP)
+    _sleep("after_post_update_sleep")
 
-    # Step 4: verify on both
-    steps["p52_step4_verify_a"] = dr_status(http_a, PRIMARY_ADDR, PRIMARY_TOKEN)
-    _step_sleep("between_verify_a_b")
-    steps["p52_step4_verify_b"] = dr_status(http_b, SECONDARY_ADDR, PRIMARY_TOKEN)
+    # Step 4 (PDF p52): verify status on both
+    steps["p52_step4_verify_a"] = dr_status(http_a, A_ADDR)
+    _sleep("between_verify_a_b")
+    steps["p52_step4_verify_b"] = dr_status(http_b, B_ADDR)
 
     return {
         "statusCode": 200,
