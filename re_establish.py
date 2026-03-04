@@ -17,8 +17,7 @@ B_ADDR = os.environ["VAULT_SECONDARY_ADDR"]
 # PDF step-2 uses id=<cluster-b-region>
 B_ID = os.environ["VAULT_SECONDARY_CLUSTER_ID"]
 
-# ✅ Per your requirement: export Cluster A token in BOTH clusters
-# In Lambda, this means: use this token in X-Vault-Token for ALL calls (A and B)
+# ✅ Use Cluster A token in BOTH clusters (same as "export VAULT_TOKEN=<cluster-a-token>" everywhere)
 A_TOKEN_SECRET_ID = os.environ["VAULT_A_TOKEN_SECRET_ID"]
 VAULT_TOKEN_JSON_KEY = os.environ.get("VAULT_TOKEN_JSON_KEY", "token")  # used only if secret is JSON
 
@@ -29,7 +28,7 @@ DR_OP_JSON_KEY = os.environ.get("FAILOVER_TOKEN_JSON_KEY", "token")
 # CA cert secrets
 A_CA_SECRET_ID = os.environ["VAULT_PRIMARY_CA_SECRET_ID"]
 B_CA_SECRET_ID = os.environ["VAULT_SECONDARY_CA_SECRET_ID"]
-VAULT_CA_SECRET_JSON_KEY = os.environ.get("VAULT_CA_SECRET_JSON_KEY")  # optional
+VAULT_CA_SECRET_JSON_KEY = os.environ.get("VAULT_CA_SECRET_JSON_KEY")  # optional (if CA secret is JSON)
 
 A_CA_PATH = "/tmp/vault-a-ca.pem"
 B_CA_PATH = "/tmp/vault-b-ca.pem"
@@ -70,7 +69,7 @@ def _write_ca_to_tmp(secret_id: str, out_path: str) -> str:
     raw = _load_secret_string(secret_id).strip()
     pem = raw
     if VAULT_CA_SECRET_JSON_KEY:
-        pem = json.loads(raw).get(VAULT_CA_SECRET_JSON_KEY)
+        pem = (json.loads(raw) or {}).get(VAULT_CA_SECRET_JSON_KEY)
 
     if not pem or "BEGIN CERTIFICATE" not in pem:
         raise Exception(f"CA PEM invalid/missing in secret: {secret_id}")
@@ -140,11 +139,28 @@ def require_ok(step: str, status: int, data: dict, ok=(200, 204)):
 
 
 def dr_status(http, addr: str, token: str):
-    st, data = vault_get(http, addr, token, "sys/replication/dr/status")
-    mode = ((data.get("data") or {}).get("mode"))
-    state = ((data.get("data") or {}).get("state"))
-    conn = ((data.get("data") or {}).get("connection_state")) or ((data.get("data") or {}).get("connection_status"))
-    return {"http": st, "mode": mode, "state": state, "connection": conn, "raw": data}
+    """
+    Compact DR status (no massive raw JSON) — shows only operator-useful fields.
+    """
+    st, payload = vault_get(http, addr, token, "sys/replication/dr/status")
+    data = payload.get("data") or {}
+
+    known_primary = data.get("known_primary_cluster_addrs") or []
+    known_secondary = data.get("known_secondaries") or []
+
+    return {
+        "http": st,
+        "mode": data.get("mode"),
+        "state": data.get("state"),
+        "connection_state": data.get("connection_state") or data.get("connection_status"),
+        "primary_cluster_addr": data.get("primary_cluster_addr") or data.get("known_primary_cluster_addr"),
+        "secondary_id": data.get("secondary_id"),
+        "ssct_generation_counter": data.get("ssct_generation_counter"),
+        "known_primary_cluster_addrs_count": len(known_primary),
+        "known_primary_cluster_addrs_sample": known_primary[:2],
+        "known_secondaries_count": len(known_secondary),
+        "errors": payload.get("errors"),
+    }
 
 
 # ----------------------------
@@ -165,7 +181,7 @@ def run_re_establish_dr(event, context):
     event = event or {}
 
     if event.get("dry_run"):
-        return {"statusCode": 200, "body": json.dumps({"message": "dry_run=true, not executing"})}
+        return {"statusCode": 200, "mode": "re_establish_dr", "message": "dry_run=true, not executing"}
 
     # Load token (Cluster A token)
     token = _extract_value(A_TOKEN_SECRET_ID, VAULT_TOKEN_JSON_KEY)
@@ -176,28 +192,31 @@ def run_re_establish_dr(event, context):
     http_a = build_http(A_CA_PATH)
     http_b = build_http(B_CA_PATH)
 
-    # validate_only mode
+    # validate_only mode (compact)
     if event.get("validate_only"):
-        out = {
+        return {
+            "statusCode": 200,
             "mode": "re_establish_dr",
+            "primary_addr": A_ADDR,
+            "secondary_addr": B_ADDR,
+            "secondary_cluster_id_used": B_ID,
             "cluster_a_status": dr_status(http_a, A_ADDR, token),
             "cluster_b_status": dr_status(http_b, B_ADDR, token),
         }
-        return {"statusCode": 200, "body": json.dumps(out, default=str)}
-
-    steps = {}
 
     # Precheck A mode; demote only if A is primary
     a_stat = dr_status(http_a, A_ADDR, token)
-    steps["precheck_cluster_a"] = a_stat
 
+    demote_skipped = True
+    demote_reason = None
     if a_stat["http"] == 200 and a_stat["mode"] == "primary":
+        demote_skipped = False
         st0, d0 = vault_post(http_a, A_ADDR, token, "sys/replication/dr/primary/demote", payload={})
         require_ok("p51_pre_demote_cluster_a", st0, d0)
-        steps["p51_pre_demote_cluster_a"] = {"skipped": False, "http": st0}
         _sleep("after_demote")
     else:
-        steps["p51_pre_demote_cluster_a"] = {"skipped": True, "reason": f"a_mode={a_stat.get('mode')}"}
+        demote_reason = f"a_mode={a_stat.get('mode')}"
+        demote_skipped = True
 
     # Step 1: Cluster A generate-public-key
     st1, d1 = vault_post(http_a, A_ADDR, token, "sys/replication/dr/secondary/generate-public-key", payload={})
@@ -205,15 +224,18 @@ def run_re_establish_dr(event, context):
 
     pub = (d1.get("data") or {}).get("secondary_public_key")
     if not pub:
-        raise Exception(json.dumps({"step": "p51_step1_generate_public_key", "error": "secondary_public_key missing", "response": d1}))
-    steps["p51_step1_generate_public_key"] = {"http": st1, "secondary_public_key_prefix": pub[:12] + "..."}
+        raise Exception(json.dumps({
+            "step": "p51_step1_generate_public_key",
+            "error": "secondary_public_key missing",
+            "response": d1
+        }))
     _sleep("after_public_key")
 
-    # Step 2: Cluster B generate activation token
+    # Step 2: Cluster B generate activation token (still using Cluster A token)
     st2, d2 = vault_post(
         http_b,
         B_ADDR,
-        token,  # ✅ Cluster A token used on B per your requirement
+        token,
         "sys/replication/dr/primary/secondary-token",
         payload={"secondary_public_key": pub, "id": B_ID},
     )
@@ -221,8 +243,11 @@ def run_re_establish_dr(event, context):
 
     activation = (d2.get("data") or {}).get("token")
     if not activation:
-        raise Exception(json.dumps({"step": "p51_step2_generate_activation_token", "error": "token missing", "response": d2}))
-    steps["p51_step2_generate_activation_token"] = {"http": st2, "activation_token_prefix": activation[:12] + "..."}
+        raise Exception(json.dumps({
+            "step": "p51_step2_generate_activation_token",
+            "error": "token missing",
+            "response": d2
+        }))
     _sleep("after_activation_token")
 
     # Step 3: Cluster A update-primary (needs dr_operation_token)
@@ -236,20 +261,43 @@ def run_re_establish_dr(event, context):
         payload={"dr_operation_token": dr_op_token, "token": activation},
     )
     require_ok("p52_step3_update_primary", st3, d3)
-    steps["p52_step3_update_primary"] = {"http": st3, "response": d3}
 
     print(f"[wait] post_update: sleeping {POST_UPDATE_SLEEP_SECONDS}s")
     time.sleep(POST_UPDATE_SLEEP_SECONDS)
     _sleep("after_post_update")
 
-    # Step 4: verify dr status
-    steps["p52_step4_verify_a"] = dr_status(http_a, A_ADDR, token)
+    # Step 4: verify dr status (compact)
+    verify_a = dr_status(http_a, A_ADDR, token)
     _sleep("between_verify_a_b")
-    steps["p52_step4_verify_b"] = dr_status(http_b, B_ADDR, token)
+    verify_b = dr_status(http_b, B_ADDR, token)
 
-    out = {
+    # Clean output like your enable_replica screenshot
+    return {
+        "statusCode": 200,
         "mode": "re_establish_dr",
-        "steps": steps,
-        "expected": {"cluster_b_mode_should_be": "primary", "cluster_a_mode_should_be": "secondary"},
+
+        "primary_addr": A_ADDR,
+        "secondary_addr": B_ADDR,
+        "secondary_cluster_id_used": B_ID,
+
+        "precheck_cluster_a": a_stat,
+
+        "step0_demote_skipped": demote_skipped,
+        "step0_demote_reason": demote_reason,
+
+        "step1_generate_public_key_http": st1,
+        "step1_secondary_public_key_prefix": pub[:12] + "...",
+
+        "step2_generate_activation_token_http": st2,
+        "step2_activation_token_prefix": activation[:12] + "...",
+
+        "step3_update_primary_http": st3,
+
+        "verify_cluster_a": verify_a,
+        "verify_cluster_b": verify_b,
+
+        "expected": {
+            "cluster_b_mode_should_be": "primary",
+            "cluster_a_mode_should_be": "secondary",
+        },
     }
-    return {"statusCode": 200, "body": json.dumps(out, default=str)}
