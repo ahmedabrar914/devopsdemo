@@ -66,7 +66,7 @@ vault-init:
       )"
 
       if [ -z "${VAULT_NODE_IPS}" ]; then
-        echo "ERROR: No running Vault instances found for Name=${VAULT_TAG_NAME}"
+        echo "ERROR: No running Vault instances found for Name=${VAULT_TAG_NAME} in ${AWS_REGION}"
         exit 1
       fi
 
@@ -92,28 +92,35 @@ vault-init:
       AWS_REGION="__AWS_REGION__"
       TARGET="__TARGET__"
 
+      cleanup() {
+        unset INIT_JSON ROOT_TOKEN SECRET_PAYLOAD STATUS_OUT
+      }
+      trap cleanup EXIT
+
       echo "Running on bastion: $(hostname)"
       echo "Candidate Vault nodes: ${VAULT_NODE_IPS_ONE_LINE}"
       echo "Target secret: ${ROOT_TOKEN_SECRET_NAME}"
 
       ssh_base() {
+        local ip="$1"
+        local cmd="$2"
         ssh -i "${SSH_KEY_PATH_ON_BASTION}" \
           -o StrictHostKeyChecking=no \
           -o UserKnownHostsFile=/dev/null \
           -o ConnectTimeout=10 \
           -o ServerAliveInterval=5 \
           -o ServerAliveCountMax=3 \
-          "${SSH_USER}@${1}" "${2}"
+          "${SSH_USER}@${ip}" "${cmd}"
       }
 
-      find_working_node() {
+      pick_working_node() {
         for ip in ${VAULT_NODE_IPS_ONE_LINE}; do
-          echo "Probing Vault node: ${ip}"
+          echo "Probing node ${ip}"
           set +e
-          ssh_base "${ip}" "echo connected" >/tmp/ssh_probe.out 2>/tmp/ssh_probe.err
+          ssh_base "${ip}" "echo connected" >/dev/null 2>&1
           rc=$?
           set -e
-          if [ $rc -eq 0 ]; then
+          if [ "${rc}" -eq 0 ]; then
             echo "${ip}"
             return 0
           fi
@@ -121,7 +128,7 @@ vault-init:
         return 1
       }
 
-      TARGET_VAULT_IP="$(find_working_node)"
+      TARGET_VAULT_IP="$(pick_working_node)"
       if [ -z "${TARGET_VAULT_IP}" ]; then
         echo "ERROR: Could not SSH to any Vault node"
         exit 1
@@ -130,18 +137,17 @@ vault-init:
       echo "Selected Vault node: ${TARGET_VAULT_IP}"
 
       remote_vault() {
-        local vault_cmd="$1"
+        local vault_subcmd="$1"
         ssh_base "${TARGET_VAULT_IP}" "sudo -i /bin/bash -lc '
+          set -euo pipefail
           unset VAULT_ADDR VAULT_CACERT
           export VAULT_ADDR=${VAULT_ADDR_LOCAL}
           export VAULT_CACERT=${VAULT_CACERT_PATH}
-          echo Using VAULT_ADDR=\$VAULT_ADDR
-          echo Using VAULT_CACERT=\$VAULT_CACERT
-          /usr/bin/vault ${vault_cmd}
+          /usr/bin/vault ${vault_subcmd}
         '"
       }
 
-      echo "Checking if secret already exists..."
+      echo "Checking whether token secret already exists..."
       set +e
       aws secretsmanager describe-secret \
         --region "${AWS_REGION}" \
@@ -149,7 +155,7 @@ vault-init:
       SECRET_EXISTS_RC=$?
       set -e
 
-      echo "Checking if Vault is already initialized..."
+      echo "Checking whether Vault is already initialized..."
       set +e
       STATUS_OUT="$(remote_vault "operator init -status" 2>&1)"
       STATUS_RC=$?
@@ -165,30 +171,27 @@ vault-init:
           exit 0
         fi
 
-        echo "ERROR: Vault is already initialized, but secret ${ROOT_TOKEN_SECRET_NAME} does not exist."
-        echo "The original init root token cannot be recovered by rerunning init."
+        echo "ERROR: Vault is already initialized, but ${ROOT_TOKEN_SECRET_NAME} does not exist in Secrets Manager."
+        echo "ERROR: Original init token cannot be recovered by rerunning init."
         exit 2
       fi
 
       if [ "${STATUS_RC}" -ne 2 ]; then
-        echo "ERROR: Unexpected return code from 'vault operator init -status': ${STATUS_RC}"
+        echo "ERROR: Unexpected exit code from 'vault operator init -status': ${STATUS_RC}"
         exit 1
       fi
 
-      echo "Vault is not initialized. Running initialization..."
-      INIT_JSON_FILE="/tmp/vault-init-${TARGET}.json"
+      echo "Vault is not initialized. Running initialization now..."
+      INIT_JSON="$(remote_vault "operator init -format=json")"
 
-      remote_vault "operator init -format=json" > "${INIT_JSON_FILE}"
-
-      if [ ! -s "${INIT_JSON_FILE}" ]; then
-        echo "ERROR: Init output file is empty"
+      if [ -z "${INIT_JSON}" ]; then
+        echo "ERROR: Vault init returned empty output"
         exit 1
       fi
 
-      ROOT_TOKEN="$(jq -r '.root_token' "${INIT_JSON_FILE}")"
-
+      ROOT_TOKEN="$(printf '%s' "${INIT_JSON}" | jq -r '.root_token')"
       if [ -z "${ROOT_TOKEN}" ] || [ "${ROOT_TOKEN}" = "null" ]; then
-        echo "ERROR: Could not extract root token from init output"
+        echo "ERROR: Failed to extract root_token from init output"
         exit 1
       fi
 
@@ -205,26 +208,27 @@ vault-init:
         }'
       )"
 
-      echo "Writing root token to Secrets Manager..."
-
+      echo "Writing token to Secrets Manager..."
       if [ "${SECRET_EXISTS_RC}" -eq 0 ]; then
         aws secretsmanager put-secret-value \
           --region "${AWS_REGION}" \
           --secret-id "${ROOT_TOKEN_SECRET_NAME}" \
           --secret-string "${SECRET_PAYLOAD}" >/dev/null
-        echo "Updated existing secret."
+        echo "Updated existing secret ${ROOT_TOKEN_SECRET_NAME}"
       else
         aws secretsmanager create-secret \
           --region "${AWS_REGION}" \
           --name "${ROOT_TOKEN_SECRET_NAME}" \
           --secret-string "${SECRET_PAYLOAD}" >/dev/null
-        echo "Created new secret."
+        echo "Created secret ${ROOT_TOKEN_SECRET_NAME}"
       fi
 
-      rm -f "${INIT_JSON_FILE}"
-      unset ROOT_TOKEN SECRET_PAYLOAD
+      echo "Verifying secret write..."
+      aws secretsmanager describe-secret \
+        --region "${AWS_REGION}" \
+        --secret-id "${ROOT_TOKEN_SECRET_NAME}" >/dev/null
 
-      echo "Vault initialization and secret storage completed successfully."
+      echo "Vault initialization completed and token stored successfully."
       EOF
 
       sed -i \
@@ -262,18 +266,19 @@ vault-init:
 
     - |
       echo "=== [$TARGET] Waiting for SSM execution ==="
+      FINAL_STATUS=""
 
       for i in $(seq 1 90); do
-        STATUS="$(aws ssm get-command-invocation \
+        FINAL_STATUS="$(aws ssm get-command-invocation \
           --region "${AWS_REGION}" \
           --command-id "${CMD_ID}" \
           --instance-id "${BASTION_INSTANCE_ID}" \
           --query 'Status' \
           --output text 2>/dev/null || true)"
 
-        echo "Poll ${i}: Status=${STATUS}"
+        echo "Poll ${i}: Status=${FINAL_STATUS}"
 
-        case "${STATUS}" in
+        case "${FINAL_STATUS}" in
           Success|Failed|Cancelled|TimedOut|Cancelling)
             break
             ;;
@@ -298,16 +303,10 @@ vault-init:
         --query "StandardErrorContent" \
         --output text || true
 
-      FINAL_STATUS="$(aws ssm get-command-invocation \
-        --region "${AWS_REGION}" \
-        --command-id "${CMD_ID}" \
-        --instance-id "${BASTION_INSTANCE_ID}" \
-        --query 'Status' \
-        --output text)"
-
       echo "Final SSM Status: ${FINAL_STATUS}"
 
       if [ "${FINAL_STATUS}" != "Success" ]; then
+        echo "ERROR: SSM command failed for ${TARGET}"
         exit 1
       fi
 
