@@ -6,9 +6,9 @@ vault-init:
     matrix:
       - TARGET: "PRIMARY"
         AWS_REGION: "us-west-2"
-        VAULT_TAG_NAME: "vaas-staging"
-        BASTION_INSTANCE_ID: "i-035c86b6405b6ab1b"
-        SSH_KEY_PATH_ON_BASTION: "/usr/bin/vaas-staging/vault-staging-ssh-key.pem"
+        VAULT_TAG_NAME: "vaas-dev-primary"
+        BASTION_INSTANCE_ID: "i-0957342a4e454e69e"
+        SSH_KEY_PATH_ON_BASTION: "/usr/bin/vaas-dev-primary/vault-dev-primary-ssh-key.pem"
         SSH_USER: "ubuntu"
         VAULT_ADDR_LOCAL: "https://127.0.0.1:8200"
         VAULT_CACERT_PATH: "/etc/vault.d/tls/ca.pem"
@@ -37,7 +37,6 @@ vault-init:
     - aws --version
 
   script:
-    # 1) Assume AWS role via OIDC
     - |
       echo "=== [$TARGET] Assuming role via OIDC ==="
       aws_sts_output="$(aws sts assume-role-with-web-identity \
@@ -54,9 +53,8 @@ vault-init:
 
       aws sts get-caller-identity
 
-    # 2) Discover any running Vault node by tag and pick the first one
     - |
-      echo "=== [$TARGET] Discovering Vault nodes (Name=${VAULT_TAG_NAME}) in ${AWS_REGION} ==="
+      echo "=== [$TARGET] Discovering Vault nodes in ${AWS_REGION} ==="
       VAULT_NODE_IPS="$(
         aws ec2 describe-instances \
           --region "${AWS_REGION}" \
@@ -68,23 +66,16 @@ vault-init:
       )"
 
       if [ -z "${VAULT_NODE_IPS}" ]; then
-        echo "ERROR: No running Vault instances found for Name=${VAULT_TAG_NAME} in ${AWS_REGION}"
+        echo "ERROR: No running Vault instances found for Name=${VAULT_TAG_NAME}"
         exit 1
       fi
 
       echo "Discovered node IPs:"
       echo "${VAULT_NODE_IPS}"
 
-      TARGET_VAULT_IP="$(echo "${VAULT_NODE_IPS}" | head -n 1 | xargs)"
-      if [ -z "${TARGET_VAULT_IP}" ]; then
-        echo "ERROR: Could not select Vault node IP"
-        exit 1
-      fi
+      VAULT_NODE_IPS_ONE_LINE="$(echo "${VAULT_NODE_IPS}" | tr '\n' ' ' | xargs)"
+      export VAULT_NODE_IPS_ONE_LINE
 
-      echo "Selected Vault node: ${TARGET_VAULT_IP}"
-      export TARGET_VAULT_IP
-
-    # 3) Build bastion script
     - |
       echo "=== [$TARGET] Building bastion init script ==="
 
@@ -92,7 +83,7 @@ vault-init:
       #!/bin/bash
       set -euo pipefail
 
-      TARGET_VAULT_IP="__TARGET_VAULT_IP__"
+      VAULT_NODE_IPS_ONE_LINE="__VAULT_NODE_IPS__"
       SSH_KEY_PATH_ON_BASTION="__SSH_KEY__"
       SSH_USER="__SSH_USER__"
       VAULT_ADDR_LOCAL="__VAULT_ADDR__"
@@ -102,44 +93,99 @@ vault-init:
       TARGET="__TARGET__"
 
       echo "Running on bastion: $(hostname)"
-      echo "Target Vault node: ${TARGET_VAULT_IP}"
+      echo "Candidate Vault nodes: ${VAULT_NODE_IPS_ONE_LINE}"
       echo "Target secret: ${ROOT_TOKEN_SECRET_NAME}"
 
-      remote_vault_cmd() {
-        local cmd="$1"
-        sudo -i bash -lc "ssh -i ${SSH_KEY_PATH_ON_BASTION} \
+      ssh_base() {
+        ssh -i "${SSH_KEY_PATH_ON_BASTION}" \
           -o StrictHostKeyChecking=no \
           -o UserKnownHostsFile=/dev/null \
-          ${SSH_USER}@${TARGET_VAULT_IP} \
-          \"sudo -i bash -lc 'export VAULT_ADDR=${VAULT_ADDR_LOCAL}; export VAULT_CACERT=${VAULT_CACERT_PATH}; ${cmd}'\""
+          -o ConnectTimeout=10 \
+          -o ServerAliveInterval=5 \
+          -o ServerAliveCountMax=3 \
+          "${SSH_USER}@${1}" "${2}"
       }
+
+      find_working_node() {
+        for ip in ${VAULT_NODE_IPS_ONE_LINE}; do
+          echo "Probing Vault node: ${ip}"
+          set +e
+          ssh_base "${ip}" "echo connected" >/tmp/ssh_probe.out 2>/tmp/ssh_probe.err
+          rc=$?
+          set -e
+          if [ $rc -eq 0 ]; then
+            echo "${ip}"
+            return 0
+          fi
+        done
+        return 1
+      }
+
+      TARGET_VAULT_IP="$(find_working_node)"
+      if [ -z "${TARGET_VAULT_IP}" ]; then
+        echo "ERROR: Could not SSH to any Vault node"
+        exit 1
+      fi
+
+      echo "Selected Vault node: ${TARGET_VAULT_IP}"
+
+      remote_vault() {
+        local vault_cmd="$1"
+        ssh_base "${TARGET_VAULT_IP}" "sudo -i /bin/bash -lc '
+          unset VAULT_ADDR VAULT_CACERT
+          export VAULT_ADDR=${VAULT_ADDR_LOCAL}
+          export VAULT_CACERT=${VAULT_CACERT_PATH}
+          echo Using VAULT_ADDR=\$VAULT_ADDR
+          echo Using VAULT_CACERT=\$VAULT_CACERT
+          /usr/bin/vault ${vault_cmd}
+        '"
+      }
+
+      echo "Checking if secret already exists..."
+      set +e
+      aws secretsmanager describe-secret \
+        --region "${AWS_REGION}" \
+        --secret-id "${ROOT_TOKEN_SECRET_NAME}" >/dev/null 2>&1
+      SECRET_EXISTS_RC=$?
+      set -e
 
       echo "Checking if Vault is already initialized..."
       set +e
-      remote_vault_cmd "vault operator init -status"
-      INIT_STATUS_RC=$?
+      STATUS_OUT="$(remote_vault "operator init -status" 2>&1)"
+      STATUS_RC=$?
       set -e
 
-      # vault operator init -status:
-      #   exit 0 => initialized
-      #   exit 2 => not initialized
-      if [ "${INIT_STATUS_RC}" -eq 0 ]; then
-        echo "Vault is already initialized on ${TARGET}. Skipping initialization."
-        exit 0
-      elif [ "${INIT_STATUS_RC}" -ne 2 ]; then
-        echo "ERROR: Unexpected return code from 'vault operator init -status': ${INIT_STATUS_RC}"
+      echo "${STATUS_OUT}"
+
+      if [ "${STATUS_RC}" -eq 0 ]; then
+        echo "Vault is already initialized."
+
+        if [ "${SECRET_EXISTS_RC}" -eq 0 ]; then
+          echo "Secret already exists. Nothing to do."
+          exit 0
+        fi
+
+        echo "ERROR: Vault is already initialized, but secret ${ROOT_TOKEN_SECRET_NAME} does not exist."
+        echo "The original init root token cannot be recovered by rerunning init."
+        exit 2
+      fi
+
+      if [ "${STATUS_RC}" -ne 2 ]; then
+        echo "ERROR: Unexpected return code from 'vault operator init -status': ${STATUS_RC}"
         exit 1
       fi
 
       echo "Vault is not initialized. Running initialization..."
-      INIT_JSON="$(remote_vault_cmd "vault operator init -format=json")"
+      INIT_JSON_FILE="/tmp/vault-init-${TARGET}.json"
 
-      if [ -z "${INIT_JSON}" ]; then
-        echo "ERROR: Vault init returned empty output"
+      remote_vault "operator init -format=json" > "${INIT_JSON_FILE}"
+
+      if [ ! -s "${INIT_JSON_FILE}" ]; then
+        echo "ERROR: Init output file is empty"
         exit 1
       fi
 
-      ROOT_TOKEN="$(echo "${INIT_JSON}" | jq -r '.root_token')"
+      ROOT_TOKEN="$(jq -r '.root_token' "${INIT_JSON_FILE}")"
 
       if [ -z "${ROOT_TOKEN}" ] || [ "${ROOT_TOKEN}" = "null" ]; then
         echo "ERROR: Could not extract root token from init output"
@@ -159,38 +205,30 @@ vault-init:
         }'
       )"
 
-      echo "Storing root token in Secrets Manager..."
-
-      set +e
-      aws secretsmanager describe-secret \
-        --region "${AWS_REGION}" \
-        --secret-id "${ROOT_TOKEN_SECRET_NAME}" >/dev/null 2>&1
-      SECRET_EXISTS_RC=$?
-      set -e
+      echo "Writing root token to Secrets Manager..."
 
       if [ "${SECRET_EXISTS_RC}" -eq 0 ]; then
         aws secretsmanager put-secret-value \
           --region "${AWS_REGION}" \
           --secret-id "${ROOT_TOKEN_SECRET_NAME}" \
           --secret-string "${SECRET_PAYLOAD}" >/dev/null
-        echo "Updated existing secret: ${ROOT_TOKEN_SECRET_NAME}"
+        echo "Updated existing secret."
       else
         aws secretsmanager create-secret \
           --region "${AWS_REGION}" \
           --name "${ROOT_TOKEN_SECRET_NAME}" \
           --secret-string "${SECRET_PAYLOAD}" >/dev/null
-        echo "Created new secret: ${ROOT_TOKEN_SECRET_NAME}"
+        echo "Created new secret."
       fi
 
-      unset ROOT_TOKEN
-      unset INIT_JSON
-      unset SECRET_PAYLOAD
+      rm -f "${INIT_JSON_FILE}"
+      unset ROOT_TOKEN SECRET_PAYLOAD
 
-      echo "Vault initialization completed successfully for ${TARGET}"
+      echo "Vault initialization and secret storage completed successfully."
       EOF
 
       sed -i \
-        -e "s|__TARGET_VAULT_IP__|${TARGET_VAULT_IP}|g" \
+        -e "s|__VAULT_NODE_IPS__|${VAULT_NODE_IPS_ONE_LINE}|g" \
         -e "s|__SSH_KEY__|${SSH_KEY_PATH_ON_BASTION}|g" \
         -e "s|__SSH_USER__|${SSH_USER}|g" \
         -e "s|__VAULT_ADDR__|${VAULT_ADDR_LOCAL}|g" \
@@ -204,7 +242,6 @@ vault-init:
       B64_SCRIPT="$(base64 vault_init.sh | tr -d '\n')"
       export B64_SCRIPT
 
-    # 4) Send script to bastion via SSM
     - |
       echo "=== [$TARGET] Sending SSM command to ${BASTION_INSTANCE_ID} in ${AWS_REGION} ==="
       CMD_ID="$(aws ssm send-command \
@@ -216,22 +253,34 @@ vault-init:
           \"chmod +x /tmp/vault_init.sh\",
           \"bash /tmp/vault_init.sh\"
         ]" \
+        --timeout-seconds 900 \
         --query "Command.CommandId" \
         --output text)"
 
       echo "SSM CommandId: ${CMD_ID}"
       export CMD_ID
 
-    # 5) Wait and print output
     - |
       echo "=== [$TARGET] Waiting for SSM execution ==="
-      set +e
-      aws ssm wait command-executed \
-        --region "${AWS_REGION}" \
-        --command-id "${CMD_ID}" \
-        --instance-id "${BASTION_INSTANCE_ID}"
-      WAIT_RC=$?
-      set -e
+
+      for i in $(seq 1 90); do
+        STATUS="$(aws ssm get-command-invocation \
+          --region "${AWS_REGION}" \
+          --command-id "${CMD_ID}" \
+          --instance-id "${BASTION_INSTANCE_ID}" \
+          --query 'Status' \
+          --output text 2>/dev/null || true)"
+
+        echo "Poll ${i}: Status=${STATUS}"
+
+        case "${STATUS}" in
+          Success|Failed|Cancelled|TimedOut|Cancelling)
+            break
+            ;;
+        esac
+
+        sleep 10
+      done
 
       echo "==== [$TARGET] STDOUT ===="
       aws ssm get-command-invocation \
@@ -249,7 +298,18 @@ vault-init:
         --query "StandardErrorContent" \
         --output text || true
 
-      exit $WAIT_RC
+      FINAL_STATUS="$(aws ssm get-command-invocation \
+        --region "${AWS_REGION}" \
+        --command-id "${CMD_ID}" \
+        --instance-id "${BASTION_INSTANCE_ID}" \
+        --query 'Status' \
+        --output text)"
+
+      echo "Final SSM Status: ${FINAL_STATUS}"
+
+      if [ "${FINAL_STATUS}" != "Success" ]; then
+        exit 1
+      fi
 
   needs:
     - dev-primary-peering-apply
