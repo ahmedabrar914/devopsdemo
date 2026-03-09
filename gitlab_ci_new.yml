@@ -18,9 +18,12 @@ stages:
   - validate
   - terraform-format-check
   - terraform-scan
-  - dev-primary-bootstrap
-  - dev-dr-bootstrap
-  - dev-primary-peering
+  - dev-primary-bootstrap-plan
+  - dev-primary-bootstrap-apply
+  - dev-dr-plan
+  - dev-dr-apply
+  - dev-primary-peering-plan
+  - dev-primary-peering-apply
   - notify
 
 variables:
@@ -57,9 +60,10 @@ secret_detection:
       aud: https://gitlab.corp.zscaler.com
   before_script:
     - apk update
-    - apk add --no-cache aws-cli bash
+    - apk add --no-cache aws-cli bash git
     - *assume_aws_stage_role
     - cp ./environments/dev/backend.tf ./backend.tf
+    - terraform version
     - terraform init
     - terraform validate
 
@@ -68,22 +72,22 @@ check-rebased:
   image: alpine/git:latest
   script:
     - |
-      if [ "$CI_COMMIT_BRANCH" = "main" ]; then
-        echo "On main branch, continuing pipeline"
+      if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
+        echo "On default branch, continuing pipeline"
         exit 0
       fi
 
-      git fetch origin main
+      git fetch origin "$CI_DEFAULT_BRANCH"
 
-      MERGE_BASE=$(git merge-base HEAD origin/main)
-      MAIN_HEAD=$(git rev-parse origin/main)
+      MERGE_BASE=$(git merge-base HEAD origin/"$CI_DEFAULT_BRANCH")
+      MAIN_HEAD=$(git rev-parse origin/"$CI_DEFAULT_BRANCH")
 
       if [ "$MERGE_BASE" != "$MAIN_HEAD" ]; then
-        echo "ERROR: Branch $CI_COMMIT_BRANCH is not rebased on main!"
+        echo "ERROR: Branch $CI_COMMIT_BRANCH is not rebased on $CI_DEFAULT_BRANCH!"
         echo "Please rebase your branch before pushing."
         exit 1
       else
-        echo "Branch is properly rebased on main, continuing pipeline"
+        echo "Branch is properly rebased on $CI_DEFAULT_BRANCH, continuing pipeline"
       fi
   allow_failure: false
 
@@ -94,7 +98,7 @@ terraform-format-check:
     - echo "Checking Terraform formatting..."
     - |
       if ! terraform fmt -check -recursive; then
-        echo "Terraform formatting check failed"
+        echo "The following files failed formatting:"
         terraform fmt -check -recursive
         exit 1
       fi
@@ -111,16 +115,14 @@ terraform-scan:
     - tfsec .
   needs:
     - check-rebased
+  allow_failure: false
 
-dev-primary-bootstrap:
+dev-primary-bootstrap-plan:
   extends: .terraform_base
-  stage: dev-primary-bootstrap
+  stage: dev-primary-bootstrap-plan
   script:
-    - echo "Running DEV PRIMARY bootstrap with VPC peering disabled"
-    - terraform plan -out=dev-primary-bootstrap.tfplan \
-        -var-file="./environments/dev/parameters.dev.primary.tfvars" \
-        -var="vpc_peering_enabled=false"
-    - terraform apply -auto-approve dev-primary-bootstrap.tfplan
+    - echo "Planning DEV PRIMARY bootstrap with VPC peering disabled"
+    - terraform plan -out=dev-primary-bootstrap.tfplan -var-file="./environments/dev/parameters.dev.primary.tfvars" -var="vpc_peering_enabled=false"
   needs:
     - terraform-scan
   rules:
@@ -128,45 +130,88 @@ dev-primary-bootstrap:
   artifacts:
     paths:
       - dev-primary-bootstrap.tfplan
-      - status_dev_primary_bootstrap.txt
-  after_script:
-    - echo "$CI_JOB_STATUS" > status_dev_primary_bootstrap.txt
 
-dev-dr-bootstrap:
+dev-primary-bootstrap-apply:
   extends: .terraform_base
-  stage: dev-dr-bootstrap
+  stage: dev-primary-bootstrap-apply
   script:
-    - echo "Running DEV DR deployment"
-    - terraform plan -out=dev-dr-bootstrap.tfplan \
-        -var-file="./environments/dev/parameters.dev.dr.tfvars"
-    - terraform apply -auto-approve dev-dr-bootstrap.tfplan
+    - echo "Applying DEV PRIMARY bootstrap plan"
+    - terraform apply -auto-approve dev-primary-bootstrap.tfplan
   needs:
-    - dev-primary-bootstrap
+    - job: dev-primary-bootstrap-plan
+      artifacts: true
+  dependencies:
+    - dev-primary-bootstrap-plan
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
   artifacts:
     paths:
-      - dev-dr-bootstrap.tfplan
-      - status_dev_dr_bootstrap.txt
+      - status_dev_primary_bootstrap_apply.txt
   after_script:
-    - echo "$CI_JOB_STATUS" > status_dev_dr_bootstrap.txt
+    - echo "$CI_JOB_STATUS" > status_dev_primary_bootstrap_apply.txt
 
-dev-primary-enable-peering:
+dev-dr-plan:
   extends: .terraform_base
-  stage: dev-primary-peering
+  stage: dev-dr-plan
   script:
-    - echo "Re-running DEV PRIMARY with VPC peering enabled"
-    - terraform plan -out=dev-primary-peering.tfplan \
-        -var-file="./environments/dev/parameters.dev.primary.tfvars" \
-        -var="vpc_peering_enabled=true"
-    - terraform apply -auto-approve dev-primary-peering.tfplan
+    - echo "Planning DEV DR deployment"
+    - terraform plan -out=dev-dr.tfplan -var-file="./environments/dev/parameters.dev.dr.tfvars"
   needs:
-    - dev-dr-bootstrap
+    - dev-primary-bootstrap-apply
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  artifacts:
+    paths:
+      - dev-dr.tfplan
+
+dev-dr-apply:
+  extends: .terraform_base
+  stage: dev-dr-apply
+  script:
+    - echo "Applying DEV DR plan"
+    - terraform apply -auto-approve dev-dr.tfplan
+  needs:
+    - job: dev-dr-plan
+      artifacts: true
+  dependencies:
+    - dev-dr-plan
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  artifacts:
+    paths:
+      - status_dev_dr_apply.txt
+  after_script:
+    - echo "$CI_JOB_STATUS" > status_dev_dr_apply.txt
+
+dev-primary-peering-plan:
+  extends: .terraform_base
+  stage: dev-primary-peering-plan
+  script:
+    - echo "Planning DEV PRIMARY steady-state apply with peering enabled from tfvars"
+    - terraform plan -out=dev-primary-peering.tfplan -var-file="./environments/dev/parameters.dev.primary.tfvars"
+  needs:
+    - dev-dr-apply
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
   artifacts:
     paths:
       - dev-primary-peering.tfplan
-      - status_dev_primary_peering.txt
+
+dev-primary-peering-apply:
+  extends: .terraform_base
+  stage: dev-primary-peering-apply
+  script:
+    - echo "Applying DEV PRIMARY peering plan"
+    - terraform apply -auto-approve dev-primary-peering.tfplan
+  needs:
+    - job: dev-primary-peering-plan
+      artifacts: true
+  dependencies:
+    - dev-primary-peering-plan
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  artifacts:
+    paths:
+      - status_dev_primary_peering_apply.txt
   after_script:
-    - echo "$CI_JOB_STATUS" > status_dev_primary_peering.txt
+    - echo "$CI_JOB_STATUS" > status_dev_primary_peering_apply.txt
