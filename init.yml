@@ -1,0 +1,259 @@
+vault-init:
+  stage: vault-init
+  image: amazon/aws-cli:2.15.57
+
+  parallel:
+    matrix:
+      - TARGET: "PRIMARY"
+        AWS_REGION: "us-west-2"
+        VAULT_TAG_NAME: "vaas-staging"
+        BASTION_INSTANCE_ID: "i-035c86b6405b6ab1b"
+        SSH_KEY_PATH_ON_BASTION: "/usr/bin/vaas-staging/vault-staging-ssh-key.pem"
+        SSH_USER: "ubuntu"
+        VAULT_ADDR_LOCAL: "https://127.0.0.1:8200"
+        VAULT_CACERT_PATH: "/etc/vault.d/tls/ca.pem"
+        ROOT_TOKEN_SECRET_NAME: "vaas/dev/primary/root-token"
+
+      - TARGET: "DR"
+        AWS_REGION: "us-east-1"
+        VAULT_TAG_NAME: "vaas-dev-dr"
+        BASTION_INSTANCE_ID: "i-076259481ae826b71"
+        SSH_KEY_PATH_ON_BASTION: "/usr/bin/vaas-dev-dr/vault-dev-dr-ssh-key.pem"
+        SSH_USER: "ubuntu"
+        VAULT_ADDR_LOCAL: "https://127.0.0.1:8200"
+        VAULT_CACERT_PATH: "/etc/vault.d/tls/ca.pem"
+        ROOT_TOKEN_SECRET_NAME: "vaas/dev/dr/root-token"
+
+  variables:
+    KUBERNETES_POD_LABELS_INTERNET_ALLOW: "internet=allow"
+
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://gitlab.corp.zscaler.com
+
+  before_script:
+    - set -euo pipefail
+    - yum -y install bash coreutils jq >/dev/null 2>&1 || true
+    - aws --version
+
+  script:
+    # 1) Assume AWS role via OIDC
+    - |
+      echo "=== [$TARGET] Assuming role via OIDC ==="
+      aws_sts_output="$(aws sts assume-role-with-web-identity \
+        --role-arn "${STAGE_ROLE_ARN}" \
+        --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}-${TARGET}" \
+        --web-identity-token "${GITLAB_OIDC_TOKEN}" \
+        --duration-seconds 3600 \
+        --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+        --output text)"
+
+      export AWS_ACCESS_KEY_ID="$(echo "$aws_sts_output" | awk '{print $1}')"
+      export AWS_SECRET_ACCESS_KEY="$(echo "$aws_sts_output" | awk '{print $2}')"
+      export AWS_SESSION_TOKEN="$(echo "$aws_sts_output" | awk '{print $3}')"
+
+      aws sts get-caller-identity
+
+    # 2) Discover any running Vault node by tag and pick the first one
+    - |
+      echo "=== [$TARGET] Discovering Vault nodes (Name=${VAULT_TAG_NAME}) in ${AWS_REGION} ==="
+      VAULT_NODE_IPS="$(
+        aws ec2 describe-instances \
+          --region "${AWS_REGION}" \
+          --filters \
+            "Name=tag:Name,Values=${VAULT_TAG_NAME}" \
+            "Name=instance-state-name,Values=running" \
+          --query 'Reservations[].Instances[].PrivateIpAddress' \
+          --output text | tr '\t' '\n'
+      )"
+
+      if [ -z "${VAULT_NODE_IPS}" ]; then
+        echo "ERROR: No running Vault instances found for Name=${VAULT_TAG_NAME} in ${AWS_REGION}"
+        exit 1
+      fi
+
+      echo "Discovered node IPs:"
+      echo "${VAULT_NODE_IPS}"
+
+      TARGET_VAULT_IP="$(echo "${VAULT_NODE_IPS}" | head -n 1 | xargs)"
+      if [ -z "${TARGET_VAULT_IP}" ]; then
+        echo "ERROR: Could not select Vault node IP"
+        exit 1
+      fi
+
+      echo "Selected Vault node: ${TARGET_VAULT_IP}"
+      export TARGET_VAULT_IP
+
+    # 3) Build bastion script
+    - |
+      echo "=== [$TARGET] Building bastion init script ==="
+
+      cat > vault_init.sh <<'EOF'
+      #!/bin/bash
+      set -euo pipefail
+
+      TARGET_VAULT_IP="__TARGET_VAULT_IP__"
+      SSH_KEY_PATH_ON_BASTION="__SSH_KEY__"
+      SSH_USER="__SSH_USER__"
+      VAULT_ADDR_LOCAL="__VAULT_ADDR__"
+      VAULT_CACERT_PATH="__VAULT_CACERT__"
+      ROOT_TOKEN_SECRET_NAME="__ROOT_SECRET_NAME__"
+      AWS_REGION="__AWS_REGION__"
+      TARGET="__TARGET__"
+
+      echo "Running on bastion: $(hostname)"
+      echo "Target Vault node: ${TARGET_VAULT_IP}"
+      echo "Target secret: ${ROOT_TOKEN_SECRET_NAME}"
+
+      remote_vault_cmd() {
+        local cmd="$1"
+        sudo -i bash -lc "ssh -i ${SSH_KEY_PATH_ON_BASTION} \
+          -o StrictHostKeyChecking=no \
+          -o UserKnownHostsFile=/dev/null \
+          ${SSH_USER}@${TARGET_VAULT_IP} \
+          \"sudo -i bash -lc 'export VAULT_ADDR=${VAULT_ADDR_LOCAL}; export VAULT_CACERT=${VAULT_CACERT_PATH}; ${cmd}'\""
+      }
+
+      echo "Checking if Vault is already initialized..."
+      set +e
+      remote_vault_cmd "vault operator init -status"
+      INIT_STATUS_RC=$?
+      set -e
+
+      # vault operator init -status:
+      #   exit 0 => initialized
+      #   exit 2 => not initialized
+      if [ "${INIT_STATUS_RC}" -eq 0 ]; then
+        echo "Vault is already initialized on ${TARGET}. Skipping initialization."
+        exit 0
+      elif [ "${INIT_STATUS_RC}" -ne 2 ]; then
+        echo "ERROR: Unexpected return code from 'vault operator init -status': ${INIT_STATUS_RC}"
+        exit 1
+      fi
+
+      echo "Vault is not initialized. Running initialization..."
+      INIT_JSON="$(remote_vault_cmd "vault operator init -format=json")"
+
+      if [ -z "${INIT_JSON}" ]; then
+        echo "ERROR: Vault init returned empty output"
+        exit 1
+      fi
+
+      ROOT_TOKEN="$(echo "${INIT_JSON}" | jq -r '.root_token')"
+
+      if [ -z "${ROOT_TOKEN}" ] || [ "${ROOT_TOKEN}" = "null" ]; then
+        echo "ERROR: Could not extract root token from init output"
+        exit 1
+      fi
+
+      SECRET_PAYLOAD="$(jq -n \
+        --arg root_token "${ROOT_TOKEN}" \
+        --arg target "${TARGET}" \
+        --arg vault_node "${TARGET_VAULT_IP}" \
+        --arg created_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{
+          root_token: $root_token,
+          target: $target,
+          vault_node: $vault_node,
+          created_at: $created_at
+        }'
+      )"
+
+      echo "Storing root token in Secrets Manager..."
+
+      set +e
+      aws secretsmanager describe-secret \
+        --region "${AWS_REGION}" \
+        --secret-id "${ROOT_TOKEN_SECRET_NAME}" >/dev/null 2>&1
+      SECRET_EXISTS_RC=$?
+      set -e
+
+      if [ "${SECRET_EXISTS_RC}" -eq 0 ]; then
+        aws secretsmanager put-secret-value \
+          --region "${AWS_REGION}" \
+          --secret-id "${ROOT_TOKEN_SECRET_NAME}" \
+          --secret-string "${SECRET_PAYLOAD}" >/dev/null
+        echo "Updated existing secret: ${ROOT_TOKEN_SECRET_NAME}"
+      else
+        aws secretsmanager create-secret \
+          --region "${AWS_REGION}" \
+          --name "${ROOT_TOKEN_SECRET_NAME}" \
+          --secret-string "${SECRET_PAYLOAD}" >/dev/null
+        echo "Created new secret: ${ROOT_TOKEN_SECRET_NAME}"
+      fi
+
+      unset ROOT_TOKEN
+      unset INIT_JSON
+      unset SECRET_PAYLOAD
+
+      echo "Vault initialization completed successfully for ${TARGET}"
+      EOF
+
+      sed -i \
+        -e "s|__TARGET_VAULT_IP__|${TARGET_VAULT_IP}|g" \
+        -e "s|__SSH_KEY__|${SSH_KEY_PATH_ON_BASTION}|g" \
+        -e "s|__SSH_USER__|${SSH_USER}|g" \
+        -e "s|__VAULT_ADDR__|${VAULT_ADDR_LOCAL}|g" \
+        -e "s|__VAULT_CACERT__|${VAULT_CACERT_PATH}|g" \
+        -e "s|__ROOT_SECRET_NAME__|${ROOT_TOKEN_SECRET_NAME}|g" \
+        -e "s|__AWS_REGION__|${AWS_REGION}|g" \
+        -e "s|__TARGET__|${TARGET}|g" \
+        vault_init.sh
+
+      chmod +x vault_init.sh
+      B64_SCRIPT="$(base64 vault_init.sh | tr -d '\n')"
+      export B64_SCRIPT
+
+    # 4) Send script to bastion via SSM
+    - |
+      echo "=== [$TARGET] Sending SSM command to ${BASTION_INSTANCE_ID} in ${AWS_REGION} ==="
+      CMD_ID="$(aws ssm send-command \
+        --region "${AWS_REGION}" \
+        --instance-ids "${BASTION_INSTANCE_ID}" \
+        --document-name "AWS-RunShellScript" \
+        --parameters "commands=[
+          \"echo ${B64_SCRIPT} | base64 -d > /tmp/vault_init.sh\",
+          \"chmod +x /tmp/vault_init.sh\",
+          \"bash /tmp/vault_init.sh\"
+        ]" \
+        --query "Command.CommandId" \
+        --output text)"
+
+      echo "SSM CommandId: ${CMD_ID}"
+      export CMD_ID
+
+    # 5) Wait and print output
+    - |
+      echo "=== [$TARGET] Waiting for SSM execution ==="
+      set +e
+      aws ssm wait command-executed \
+        --region "${AWS_REGION}" \
+        --command-id "${CMD_ID}" \
+        --instance-id "${BASTION_INSTANCE_ID}"
+      WAIT_RC=$?
+      set -e
+
+      echo "==== [$TARGET] STDOUT ===="
+      aws ssm get-command-invocation \
+        --region "${AWS_REGION}" \
+        --command-id "${CMD_ID}" \
+        --instance-id "${BASTION_INSTANCE_ID}" \
+        --query "StandardOutputContent" \
+        --output text || true
+
+      echo "==== [$TARGET] STDERR ===="
+      aws ssm get-command-invocation \
+        --region "${AWS_REGION}" \
+        --command-id "${CMD_ID}" \
+        --instance-id "${BASTION_INSTANCE_ID}" \
+        --query "StandardErrorContent" \
+        --output text || true
+
+      exit $WAIT_RC
+
+  needs:
+    - dev-primary-peering-apply
+
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
