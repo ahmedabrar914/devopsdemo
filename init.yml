@@ -25,6 +25,7 @@ vault-init:
         ROOT_TOKEN_SECRET_NAME: "vaas/dev/dr/root-token"
 
   variables:
+    STAGE_ROLE_ARN: "arn:aws:iam::792014834907:role/gitlab-vaas-iac-role"
     KUBERNETES_POD_LABELS_INTERNET_ALLOW: "internet=allow"
 
   id_tokens:
@@ -37,6 +38,7 @@ vault-init:
     - aws --version
 
   script:
+    # 1) Assume AWS role via OIDC
     - |
       echo "=== [$TARGET] Assuming role via OIDC ==="
       aws_sts_output="$(aws sts assume-role-with-web-identity \
@@ -51,10 +53,12 @@ vault-init:
       export AWS_SECRET_ACCESS_KEY="$(echo "$aws_sts_output" | awk '{print $2}')"
       export AWS_SESSION_TOKEN="$(echo "$aws_sts_output" | awk '{print $3}')"
 
+      echo "Caller identity:"
       aws sts get-caller-identity
 
+    # 2) Discover Vault node IPs by tag
     - |
-      echo "=== [$TARGET] Discovering Vault nodes in ${AWS_REGION} ==="
+      echo "=== [$TARGET] Discovering Vault nodes (Name=${VAULT_TAG_NAME}) in ${AWS_REGION} ==="
       VAULT_NODE_IPS="$(
         aws ec2 describe-instances \
           --region "${AWS_REGION}" \
@@ -66,7 +70,7 @@ vault-init:
       )"
 
       if [ -z "${VAULT_NODE_IPS}" ]; then
-        echo "ERROR: No running Vault instances found for Name=${VAULT_TAG_NAME} in ${AWS_REGION}"
+        echo "ERROR: No running instances found for Name=${VAULT_TAG_NAME} in ${AWS_REGION}"
         exit 1
       fi
 
@@ -76,6 +80,7 @@ vault-init:
       VAULT_NODE_IPS_ONE_LINE="$(echo "${VAULT_NODE_IPS}" | tr '\n' ' ' | xargs)"
       export VAULT_NODE_IPS_ONE_LINE
 
+    # 3) Build bastion script
     - |
       echo "=== [$TARGET] Building bastion init script ==="
 
@@ -92,16 +97,16 @@ vault-init:
       AWS_REGION="__AWS_REGION__"
       TARGET="__TARGET__"
 
+      echo "Running on bastion: $(hostname)"
+      echo "Candidate Vault nodes: ${VAULT_NODE_IPS_ONE_LINE}"
+      echo "Target secret: ${ROOT_TOKEN_SECRET_NAME}"
+
       cleanup() {
         unset INIT_JSON ROOT_TOKEN SECRET_PAYLOAD STATUS_OUT
       }
       trap cleanup EXIT
 
-      echo "Running on bastion: $(hostname)"
-      echo "Candidate Vault nodes: ${VAULT_NODE_IPS_ONE_LINE}"
-      echo "Target secret: ${ROOT_TOKEN_SECRET_NAME}"
-
-      ssh_base() {
+      ssh_run() {
         local ip="$1"
         local cmd="$2"
         ssh -i "${SSH_KEY_PATH_ON_BASTION}" \
@@ -113,32 +118,10 @@ vault-init:
           "${SSH_USER}@${ip}" "${cmd}"
       }
 
-      pick_working_node() {
-        for ip in ${VAULT_NODE_IPS_ONE_LINE}; do
-          echo "Probing node ${ip}"
-          set +e
-          ssh_base "${ip}" "echo connected" >/dev/null 2>&1
-          rc=$?
-          set -e
-          if [ "${rc}" -eq 0 ]; then
-            echo "${ip}"
-            return 0
-          fi
-        done
-        return 1
-      }
-
-      TARGET_VAULT_IP="$(pick_working_node)"
-      if [ -z "${TARGET_VAULT_IP}" ]; then
-        echo "ERROR: Could not SSH to any Vault node"
-        exit 1
-      fi
-
-      echo "Selected Vault node: ${TARGET_VAULT_IP}"
-
-      remote_vault() {
-        local vault_subcmd="$1"
-        ssh_base "${TARGET_VAULT_IP}" "sudo -i /bin/bash -lc '
+      remote_vault_cmd() {
+        local ip="$1"
+        local vault_subcmd="$2"
+        ssh_run "${ip}" "sudo -i /bin/bash -lc '
           set -euo pipefail
           unset VAULT_ADDR VAULT_CACERT
           export VAULT_ADDR=${VAULT_ADDR_LOCAL}
@@ -147,7 +130,27 @@ vault-init:
         '"
       }
 
-      echo "Checking whether token secret already exists..."
+      TARGET_VAULT_IP=""
+      for ip in ${VAULT_NODE_IPS_ONE_LINE}; do
+        echo "Probing Vault node ${ip} ..."
+        set +e
+        ssh_run "${ip}" "echo connected" >/dev/null 2>&1
+        rc=$?
+        set -e
+        if [ "${rc}" -eq 0 ]; then
+          TARGET_VAULT_IP="${ip}"
+          break
+        fi
+      done
+
+      if [ -z "${TARGET_VAULT_IP}" ]; then
+        echo "ERROR: Could not SSH to any Vault node."
+        exit 1
+      fi
+
+      echo "Selected Vault node: ${TARGET_VAULT_IP}"
+
+      echo "Checking if token secret already exists..."
       set +e
       aws secretsmanager describe-secret \
         --region "${AWS_REGION}" \
@@ -155,9 +158,9 @@ vault-init:
       SECRET_EXISTS_RC=$?
       set -e
 
-      echo "Checking whether Vault is already initialized..."
+      echo "Checking if Vault is already initialized..."
       set +e
-      STATUS_OUT="$(remote_vault "operator init -status" 2>&1)"
+      STATUS_OUT="$(remote_vault_cmd "${TARGET_VAULT_IP}" "operator init -status" 2>&1)"
       STATUS_RC=$?
       set -e
 
@@ -171,18 +174,18 @@ vault-init:
           exit 0
         fi
 
-        echo "ERROR: Vault is already initialized, but ${ROOT_TOKEN_SECRET_NAME} does not exist in Secrets Manager."
+        echo "ERROR: Vault is already initialized but ${ROOT_TOKEN_SECRET_NAME} does not exist in Secrets Manager."
         echo "ERROR: Original init token cannot be recovered by rerunning init."
         exit 2
       fi
 
       if [ "${STATUS_RC}" -ne 2 ]; then
-        echo "ERROR: Unexpected exit code from 'vault operator init -status': ${STATUS_RC}"
+        echo "ERROR: Unexpected return code from 'vault operator init -status': ${STATUS_RC}"
         exit 1
       fi
 
-      echo "Vault is not initialized. Running initialization now..."
-      INIT_JSON="$(remote_vault "operator init -format=json")"
+      echo "Vault is not initialized. Running initialization..."
+      INIT_JSON="$(remote_vault_cmd "${TARGET_VAULT_IP}" "operator init -format=json")"
 
       if [ -z "${INIT_JSON}" ]; then
         echo "ERROR: Vault init returned empty output"
@@ -190,8 +193,9 @@ vault-init:
       fi
 
       ROOT_TOKEN="$(printf '%s' "${INIT_JSON}" | jq -r '.root_token')"
+
       if [ -z "${ROOT_TOKEN}" ] || [ "${ROOT_TOKEN}" = "null" ]; then
-        echo "ERROR: Failed to extract root_token from init output"
+        echo "ERROR: Could not extract root_token from init output"
         exit 1
       fi
 
@@ -208,7 +212,7 @@ vault-init:
         }'
       )"
 
-      echo "Writing token to Secrets Manager..."
+      echo "Writing root token to Secrets Manager..."
       if [ "${SECRET_EXISTS_RC}" -eq 0 ]; then
         aws secretsmanager put-secret-value \
           --region "${AWS_REGION}" \
@@ -246,6 +250,7 @@ vault-init:
       B64_SCRIPT="$(base64 vault_init.sh | tr -d '\n')"
       export B64_SCRIPT
 
+    # 4) Send to bastion via SSM
     - |
       echo "=== [$TARGET] Sending SSM command to ${BASTION_INSTANCE_ID} in ${AWS_REGION} ==="
       CMD_ID="$(aws ssm send-command \
@@ -262,12 +267,12 @@ vault-init:
         --output text)"
 
       echo "SSM CommandId: ${CMD_ID}"
-      export CMD_ID
 
+    # 5) Wait + print output
     - |
       echo "=== [$TARGET] Waiting for SSM execution ==="
-      FINAL_STATUS=""
 
+      FINAL_STATUS=""
       for i in $(seq 1 90); do
         FINAL_STATUS="$(aws ssm get-command-invocation \
           --region "${AWS_REGION}" \
