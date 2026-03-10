@@ -1,230 +1,136 @@
-import os
-import json
-import ssl
-import subprocess
-import urllib.request
-import urllib.error
+dev-dr-replication:
+  stage: dev-dr-replication
+  image: amazon/aws-cli:2.15.57
 
-PRIMARY_ADDR = os.environ["VAULT_PRIMARY_ADDR"]
-SECONDARY_ADDR = os.environ["VAULT_SECONDARY_ADDR"]
+  variables:
+    STAGE_ROLE_ARN: "arn:aws:iam::792014834907:role/gitlab-vaas-iac-role"
+    AWS_REGION: "us-west-2"
+    BASTION_INSTANCE_ID: "i-0957342a4e454e69e"
 
-PRIMARY_TOKEN_SECRET_ID = os.environ["VAULT_PRIMARY_TOKEN_SECRET_ID"]
-SECONDARY_TOKEN_SECRET_ID = os.environ["VAULT_SECONDARY_TOKEN_SECRET_ID"]
-VAULT_TOKEN_JSON_KEY = os.environ.get("VAULT_TOKEN_JSON_KEY", "root_token")
+    VAULT_PRIMARY_ADDR: "https://usw2.dev.vault.corp.zscaler.com:8200"
+    VAULT_SECONDARY_ADDR: "https://use1.dev.vault.corp.zscaler.com:8200"
 
-VAULT_CA_SECRET_ID = os.environ["VAULT_CA_SECRET_ID"]
-VAULT_CA_SECRET_JSON_KEY = os.environ.get("VAULT_CA_SECRET_JSON_KEY")
+    VAULT_PRIMARY_TOKEN_SECRET_ID: "vaas/dev/primary/root-token"
+    VAULT_SECONDARY_TOKEN_SECRET_ID: "vaas/dev/dr/root-token"
+    VAULT_TOKEN_JSON_KEY: "root_token"
 
-AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
+    VAULT_PRIMARY_CLUSTER_ID: "usw2"
+    POST_ENABLE_SLEEP_SECONDS: "8"
 
-CA_PATH = "/tmp/vault-ca.pem"
+    KUBERNETES_POD_LABELS_INTERNET_ALLOW: "internet=allow"
 
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://gitlab.corp.zscaler.com
 
-def run_cmd(cmd):
-    proc = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        check=False
-    )
-    return proc.returncode, proc.stdout, proc.stderr
+  before_script:
+    - set -euo pipefail
+    - yum -y install bash coreutils jq >/dev/null 2>&1 || true
+    - aws --version
 
+  script:
+    - |
+      echo "=== Assuming role via OIDC ==="
 
-def get_secret_value(secret_id: str) -> str:
-    cmd = [
-        "aws", "secretsmanager", "get-secret-value",
-        "--secret-id", secret_id,
-        "--region", AWS_REGION,
-        "--output", "json"
-    ]
+      aws_sts_output="$(aws sts assume-role-with-web-identity \
+        --role-arn "${STAGE_ROLE_ARN}" \
+        --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}-dr-replication" \
+        --web-identity-token "${GITLAB_OIDC_TOKEN}" \
+        --duration-seconds 3600 \
+        --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+        --output text)"
 
-    rc, stdout, stderr = run_cmd(cmd)
-    if rc != 0:
-        raise Exception(json.dumps({
-            "step": "get_secret_value",
-            "secret_id": secret_id,
-            "error": "failed to fetch secret from Secrets Manager",
-            "return_code": rc,
-            "stderr": stderr.strip()
-        }))
+      export AWS_ACCESS_KEY_ID="$(echo "$aws_sts_output" | awk '{print $1}')"
+      export AWS_SECRET_ACCESS_KEY="$(echo "$aws_sts_output" | awk '{print $2}')"
+      export AWS_SESSION_TOKEN="$(echo "$aws_sts_output" | awk '{print $3}')"
 
-    try:
-        resp = json.loads(stdout)
-    except json.JSONDecodeError as exc:
-        raise Exception(json.dumps({
-            "step": "get_secret_value",
-            "secret_id": secret_id,
-            "error": "invalid JSON returned by aws cli",
-            "details": str(exc),
-            "stdout": stdout[:1000]
-        }))
+      aws sts get-caller-identity
 
-    if resp.get("SecretString"):
-        return resp["SecretString"]
+    - |
+      echo "=== Encoding replication script ==="
+      SCRIPT_B64="$(base64 -w 0 scripts/dr_replication_no_ca.py)"
+      export SCRIPT_B64
 
-    if resp.get("SecretBinary"):
-        return resp["SecretBinary"]
+    - |
+      echo "=== Sending SSM command to bastion ==="
 
-    raise Exception(json.dumps({
-        "step": "get_secret_value",
-        "secret_id": secret_id,
-        "error": "secret does not contain SecretString or SecretBinary"
-    }))
+      CMD_ID=$(aws ssm send-command \
+        --region "$AWS_REGION" \
+        --instance-ids "$BASTION_INSTANCE_ID" \
+        --document-name "AWS-RunShellScript" \
+        --parameters commands="[
+          \"set -euo pipefail\",
+          \"echo Running on bastion: \$(hostname)\",
+          \"mkdir -p /tmp/vault-dr-replication\",
+          \"cd /tmp/vault-dr-replication\",
+          \"cat <<'EOF' | base64 -d > dr_replication_no_ca.py\",
+          \"$SCRIPT_B64\",
+          \"EOF\",
+          \"chmod 700 dr_replication_no_ca.py\",
+          \"export AWS_REGION='$AWS_REGION'\",
+          \"export VAULT_PRIMARY_ADDR='$VAULT_PRIMARY_ADDR'\",
+          \"export VAULT_SECONDARY_ADDR='$VAULT_SECONDARY_ADDR'\",
+          \"export VAULT_PRIMARY_TOKEN_SECRET_ID='$VAULT_PRIMARY_TOKEN_SECRET_ID'\",
+          \"export VAULT_SECONDARY_TOKEN_SECRET_ID='$VAULT_SECONDARY_TOKEN_SECRET_ID'\",
+          \"export VAULT_TOKEN_JSON_KEY='$VAULT_TOKEN_JSON_KEY'\",
+          \"export VAULT_PRIMARY_CLUSTER_ID='$VAULT_PRIMARY_CLUSTER_ID'\",
+          \"export POST_ENABLE_SLEEP_SECONDS='$POST_ENABLE_SLEEP_SECONDS'\",
+          \"python3 dr_replication_no_ca.py\"
+        ]" \
+        --query "Command.CommandId" \
+        --output text)
 
+      echo "SSM Command ID: $CMD_ID"
+      export CMD_ID
 
-def load_token_from_secret(secret_id: str, json_key: str) -> str:
-    secret_val = get_secret_value(secret_id)
+    - |
+      echo "=== Waiting for SSM execution ==="
 
-    try:
-        obj = json.loads(secret_val)
-    except json.JSONDecodeError:
-        raise Exception(json.dumps({
-            "step": "load_token_from_secret",
-            "secret_id": secret_id,
-            "error": "token secret must be valid JSON"
-        }))
+      STATUS=""
 
-    token = obj.get(json_key)
-    if not token:
-        raise Exception(json.dumps({
-            "step": "load_token_from_secret",
-            "secret_id": secret_id,
-            "error": f"key '{json_key}' not found in token secret"
-        }))
+      for i in $(seq 1 60); do
+        STATUS=$(aws ssm get-command-invocation \
+          --region "$AWS_REGION" \
+          --command-id "$CMD_ID" \
+          --instance-id "$BASTION_INSTANCE_ID" \
+          --query Status \
+          --output text 2>/dev/null || true)
 
-    return token
+        echo "Poll $i: Status=$STATUS"
 
+        if [[ "$STATUS" == "Success" || "$STATUS" == "Failed" || "$STATUS" == "TimedOut" || "$STATUS" == "Cancelled" ]]; then
+          break
+        fi
 
-def load_ca_to_tmp() -> str:
-    secret_val = get_secret_value(VAULT_CA_SECRET_ID)
+        sleep 10
+      done
 
-    if VAULT_CA_SECRET_JSON_KEY:
-        try:
-            obj = json.loads(secret_val)
-        except json.JSONDecodeError:
-            raise Exception(json.dumps({
-                "step": "load_ca_to_tmp",
-                "secret_id": VAULT_CA_SECRET_ID,
-                "error": "CA secret expected JSON but is not valid JSON"
-            }))
+      echo "=== SSM STDOUT ==="
+      aws ssm get-command-invocation \
+        --region "$AWS_REGION" \
+        --command-id "$CMD_ID" \
+        --instance-id "$BASTION_INSTANCE_ID" \
+        --query StandardOutputContent \
+        --output text || true
 
-        pem = obj.get(VAULT_CA_SECRET_JSON_KEY)
-    else:
-        pem = secret_val
+      echo "=== SSM STDERR ==="
+      aws ssm get-command-invocation \
+        --region "$AWS_REGION" \
+        --command-id "$CMD_ID" \
+        --instance-id "$BASTION_INSTANCE_ID" \
+        --query StandardErrorContent \
+        --output text || true
 
-    if not pem or "BEGIN CERTIFICATE" not in pem:
-        raise Exception(json.dumps({
-            "step": "load_ca_to_tmp",
-            "secret_id": VAULT_CA_SECRET_ID,
-            "error": "CA PEM not found or invalid in secret"
-        }))
+      if [ "$STATUS" != "Success" ]; then
+        echo "SSM execution failed"
+        exit 1
+      fi
 
-    with open(CA_PATH, "w", encoding="utf-8") as f:
-        f.write(pem)
+  needs:
+    - dev-primary-peering-apply
 
-    return CA_PATH
-
-
-def build_ssl_context(ca_file_path: str):
-    return ssl.create_default_context(cafile=ca_file_path)
-
-
-def parse_json_bytes(data: bytes):
-    if not data:
-        return {}
-    txt = data.decode("utf-8", errors="replace").strip()
-    if not txt:
-        return {}
-    try:
-        return json.loads(txt)
-    except json.JSONDecodeError:
-        return {"raw_response": txt}
-
-
-def vault_get(addr: str, token: str, path: str, ssl_context):
-    url = f"{addr.rstrip('/')}/v1/{path.lstrip('/')}"
-    headers = {
-        "X-Vault-Token": token,
-        "Content-Type": "application/json"
-    }
-
-    req = urllib.request.Request(
-        url=url,
-        headers=headers,
-        method="GET"
-    )
-
-    try:
-        with urllib.request.urlopen(req, context=ssl_context, timeout=20) as resp:
-            return resp.getcode(), parse_json_bytes(resp.read())
-    except urllib.error.HTTPError as e:
-        return e.code, parse_json_bytes(e.read())
-    except urllib.error.URLError as e:
-        return 0, {"error": f"URL error: {str(e.reason)}"}
-    except Exception as e:
-        return 0, {"error": f"Unexpected error: {str(e)}"}
-
-
-def summarize_cluster(name: str, addr: str, token: str, ssl_context):
-    result = {
-        "cluster": name,
-        "address": addr
-    }
-
-    health_status, health_data = vault_get(addr, token, "sys/health", ssl_context)
-    result["health_http_status"] = health_status
-    result["health_response"] = health_data
-
-    dr_status, dr_data = vault_get(addr, token, "sys/replication/dr/status", ssl_context)
-    result["dr_status_http_status"] = dr_status
-    result["dr_status_response"] = dr_data
-
-    # Small summary
-    result["summary"] = {
-        "reachable": health_status != 0,
-        "token_valid_for_dr_status": dr_status not in (0, 403),
-        "dr_mode": (dr_data.get("data") or {}).get("mode") if isinstance(dr_data, dict) else None,
-        "dr_state": (dr_data.get("data") or {}).get("state") if isinstance(dr_data, dict) else None,
-        "cluster_id": (dr_data.get("data") or {}).get("cluster_id") if isinstance(dr_data, dict) else None
-    }
-
-    return result
-
-
-def main():
-    try:
-        print("Loading CA secret")
-        ca_file = load_ca_to_tmp()
-
-        print("Loading Vault tokens from Secrets Manager")
-        primary_token = load_token_from_secret(PRIMARY_TOKEN_SECRET_ID, VAULT_TOKEN_JSON_KEY)
-        secondary_token = load_token_from_secret(SECONDARY_TOKEN_SECRET_ID, VAULT_TOKEN_JSON_KEY)
-
-        print("Building SSL context")
-        ssl_context = build_ssl_context(ca_file)
-
-        print("Checking primary Vault")
-        primary = summarize_cluster("primary", PRIMARY_ADDR, primary_token, ssl_context)
-
-        print("Checking secondary Vault")
-        secondary = summarize_cluster("secondary", SECONDARY_ADDR, secondary_token, ssl_context)
-
-        result = {
-            "statusCode": 200,
-            "primary": primary,
-            "secondary": secondary
-        }
-
-        print(json.dumps(result, indent=2))
-
-    except Exception as e:
-        result = {
-            "statusCode": 500,
-            "error": str(e)
-        }
-        print(json.dumps(result, indent=2))
-        raise SystemExit(1)
-
-
-if __name__ == "__main__":
-    main()
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: manual
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
