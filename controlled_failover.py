@@ -105,6 +105,41 @@ def load_token_from_secret(secret_id: str, json_key: str) -> str:
     }))
 
 
+def get_failover_token() -> str:
+    raw = get_secret_value(FAILOVER_TOKEN_SECRET_ID).strip()
+
+    if not raw.startswith("{"):
+        if not raw:
+            raise Exception(json.dumps({
+                "step": "get_failover_token",
+                "secret_id": FAILOVER_TOKEN_SECRET_ID,
+                "error": "failover token secret is empty"
+            }))
+        return raw
+
+    obj = try_parse_json(raw)
+    if obj is None or not isinstance(obj, dict):
+        raise Exception(json.dumps({
+            "step": "get_failover_token",
+            "secret_id": FAILOVER_TOKEN_SECRET_ID,
+            "error": "failover token secret looks like JSON but could not be parsed"
+        }))
+
+    tok = obj.get(FAILOVER_TOKEN_JSON_KEY)
+    if tok:
+        return str(tok).strip()
+
+    for key in ["token", "dr_operation_token", "failover_token"]:
+        if obj.get(key):
+            return str(obj[key]).strip()
+
+    raise Exception(json.dumps({
+        "step": "get_failover_token",
+        "secret_id": FAILOVER_TOKEN_SECRET_ID,
+        "error": f"failover token key not found in JSON secret; tried '{FAILOVER_TOKEN_JSON_KEY}', 'token', 'dr_operation_token', 'failover_token'"
+    }))
+
+
 def build_ssl_context():
     print("Using insecure TLS mode without CA for bastion test")
     return ssl._create_unverified_context()
@@ -191,41 +226,6 @@ def dr_status(ssl_context, addr: str, token: str):
 def health(ssl_context, addr: str):
     st, data = vault_request("GET", addr, "", "sys/health", payload=None, ssl_context=ssl_context)
     return {"http": st, "data": data}
-
-
-def get_failover_token() -> str:
-    raw = get_secret_value(FAILOVER_TOKEN_SECRET_ID).strip()
-
-    if not raw.startswith("{"):
-        if not raw:
-            raise Exception(json.dumps({
-                "step": "get_failover_token",
-                "secret_id": FAILOVER_TOKEN_SECRET_ID,
-                "error": "failover token secret is empty"
-            }))
-        return raw
-
-    obj = try_parse_json(raw)
-    if obj is None or not isinstance(obj, dict):
-        raise Exception(json.dumps({
-            "step": "get_failover_token",
-            "secret_id": FAILOVER_TOKEN_SECRET_ID,
-            "error": "failover token secret looks like JSON but could not be parsed"
-        }))
-
-    tok = obj.get(FAILOVER_TOKEN_JSON_KEY)
-    if tok:
-        return str(tok).strip()
-
-    for key in ["token", "dr_operation_token", "failover_token"]:
-        if obj.get(key):
-            return str(obj[key]).strip()
-
-    raise Exception(json.dumps({
-        "step": "get_failover_token",
-        "secret_id": FAILOVER_TOKEN_SECRET_ID,
-        "error": f"failover token key not found in JSON secret; tried '{FAILOVER_TOKEN_JSON_KEY}', 'token', 'dr_operation_token', 'failover_token'"
-    }))
 
 
 def run_controlled_failover(validate_only: bool = False):
