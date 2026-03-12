@@ -219,13 +219,50 @@ def require_ok(step: str, status: int, data: dict, ok=(200, 204)):
 
 
 def dr_status(ssl_context, addr: str, token: str):
-    st, data = vault_get(ssl_context, addr, token, "sys/replication/dr/status")
-    return {"http": st, "data": data}
+    st, payload = vault_get(ssl_context, addr, token, "sys/replication/dr/status")
+    data = payload.get("data") or {}
+
+    known_primary = data.get("known_primary_cluster_addrs") or []
+    known_secondary = data.get("known_secondaries") or []
+
+    return {
+        "http": st,
+        "mode": data.get("mode"),
+        "state": data.get("state"),
+        "connection_state": data.get("connection_state") or data.get("connection_status"),
+        "primary_cluster_addr": data.get("primary_cluster_addr") or data.get("known_primary_cluster_addr"),
+        "secondary_id": data.get("secondary_id"),
+        "ssct_generation_counter": data.get("ssct_generation_counter"),
+        "known_primary_cluster_addrs_count": len(known_primary),
+        "known_primary_cluster_addrs_sample": known_primary[:2],
+        "known_secondaries_count": len(known_secondary),
+        "errors": payload.get("errors"),
+        "raw_data": data
+    }
 
 
 def health(ssl_context, addr: str):
     st, data = vault_request("GET", addr, "", "sys/health", payload=None, ssl_context=ssl_context)
     return {"http": st, "data": data}
+
+
+def validate_current_state(ssl_context, primary_token: str):
+    return {
+        "primary_health": health(ssl_context, PRIMARY_ADDR),
+        "secondary_health": health(ssl_context, SECONDARY_ADDR),
+        "primary_dr_status": dr_status(ssl_context, PRIMARY_ADDR, primary_token),
+        "secondary_dr_status": dr_status(ssl_context, SECONDARY_ADDR, primary_token)
+    }
+
+
+def is_controlled_failover_already_done(checks: dict) -> bool:
+    p = checks["primary_dr_status"]
+    s = checks["secondary_dr_status"]
+
+    if p["http"] != 200 or s["http"] != 200:
+        return False
+
+    return p.get("mode") == "secondary" and s.get("mode") == "primary"
 
 
 def run_controlled_failover(validate_only: bool = False):
@@ -236,14 +273,21 @@ def run_controlled_failover(validate_only: bool = False):
     print("Building insecure SSL context")
     ssl_context = build_ssl_context()
 
+    checks = validate_current_state(ssl_context, primary_token)
+
     if validate_only:
         return {
             "statusCode": 200,
             "mode": "controlled_failover_validate_only",
-            "primary_health": health(ssl_context, PRIMARY_ADDR),
-            "secondary_health": health(ssl_context, SECONDARY_ADDR),
-            "primary_dr_status": dr_status(ssl_context, PRIMARY_ADDR, primary_token),
-            "secondary_dr_status": dr_status(ssl_context, SECONDARY_ADDR, primary_token)
+            "checks": checks
+        }
+
+    if is_controlled_failover_already_done(checks):
+        return {
+            "statusCode": 200,
+            "mode": "execute",
+            "message": "Controlled failover is already completed. No action required.",
+            "checks": checks
         }
 
     steps = {}
@@ -276,13 +320,15 @@ def run_controlled_failover(validate_only: bool = False):
     time.sleep(POST_PROMOTE_SLEEP_SECONDS)
 
     print("Step 3: Verify cluster B DR status")
-    verify = dr_status(ssl_context, SECONDARY_ADDR, primary_token)
-    steps["step3_verify_cluster_b"] = verify
+    final_checks = validate_current_state(ssl_context, primary_token)
+    steps["step3_verify_cluster_b"] = final_checks["secondary_dr_status"]
 
     return {
         "statusCode": 200,
-        "mode": "controlled_failover",
+        "mode": "execute",
         "steps": steps,
+        "initial_checks": checks,
+        "final_checks": final_checks,
         "expected": {"cluster_b_mode_should_be": "primary"}
     }
 
