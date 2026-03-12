@@ -1,34 +1,25 @@
 spec:
   inputs:
     target_env:
-      type: string
-      default: "dev"
-      options:
-        - "dev"
-        - "nonprod"
-        - "prod"
+      options: ['dev', 'nonprod', 'prod']
+      default: 'dev'
+      description: 'Select target environment'
 
     primary_region:
-      type: string
-      default: "us-west-2"
-      options:
-        - "us-west-2"
-        - "us-east-1"
+      options: ['us-west-2', 'us-east-1']
+      default: 'us-west-2'
+      description: 'Select primary region'
 
     run_mode:
-      type: string
-      default: "validate_only"
-      options:
-        - "validate_only"
-        - "execute"
-
+      options: ['validate_only', 'execute']
+      default: 'validate_only'
+      description: 'Select execution mode'
 ---
 
 controlled-failover:
   stage: controlled-failover
   image: amazon/aws-cli:2.15.57
   when: manual
-  manual_confirmation: true
 
   id_tokens:
     GITLAB_OIDC_TOKEN:
@@ -38,7 +29,6 @@ controlled-failover:
     VAULT_TOKEN_JSON_KEY: "root_token"
     FAILOVER_TOKEN_JSON_KEY: "token"
     POST_PROMOTE_SLEEP_SECONDS: "8"
-    KUBERNETES_POD_LABELS_INTERNET_ALLOW: "internet=allow"
 
   before_script:
     - set -euo pipefail
@@ -57,7 +47,6 @@ controlled-failover:
       echo "RUN_MODE=$RUN_MODE"
 
     - |
-      echo "=== Validate Inputs ==="
       case "$TARGET_ENV" in
         dev|nonprod|prod) ;;
         *)
@@ -90,19 +79,17 @@ controlled-failover:
           export PRIMARY_REGION_SHORT="usw2"
           export SECONDARY_REGION="us-east-1"
           export SECONDARY_REGION_SHORT="use1"
-          export VAULT_SECONDARY_CLUSTER_ID="use1"
           ;;
         us-east-1)
           export AWS_REGION="us-east-1"
           export PRIMARY_REGION_SHORT="use1"
           export SECONDARY_REGION="us-west-2"
           export SECONDARY_REGION_SHORT="usw2"
-          export VAULT_SECONDARY_CLUSTER_ID="usw2"
           ;;
       esac
 
     - |
-      echo "=== Derive Vault URLs and Secret Paths ==="
+      echo "=== Derive Vault URLs and Secret IDs ==="
       export VAULT_PRIMARY_ADDR="https://${PRIMARY_REGION_SHORT}.${TARGET_ENV}.vault.corp.zscaler.com:8200"
       export VAULT_SECONDARY_ADDR="https://${SECONDARY_REGION_SHORT}.${TARGET_ENV}.vault.corp.zscaler.com:8200"
 
@@ -149,19 +136,6 @@ controlled-failover:
       esac
 
     - |
-      echo "=== Final Resolved Values ==="
-      echo "AWS_REGION=$AWS_REGION"
-      echo "PRIMARY_REGION_SHORT=$PRIMARY_REGION_SHORT"
-      echo "SECONDARY_REGION=$SECONDARY_REGION"
-      echo "SECONDARY_REGION_SHORT=$SECONDARY_REGION_SHORT"
-      echo "BASTION_INSTANCE_ID=$BASTION_INSTANCE_ID"
-      echo "VAULT_PRIMARY_ADDR=$VAULT_PRIMARY_ADDR"
-      echo "VAULT_SECONDARY_ADDR=$VAULT_SECONDARY_ADDR"
-      echo "VAULT_PRIMARY_TOKEN_SECRET_ID=$VAULT_PRIMARY_TOKEN_SECRET_ID"
-      echo "FAILOVER_TOKEN_SECRET_ID=$FAILOVER_TOKEN_SECRET_ID"
-      echo "VAULT_SECONDARY_CLUSTER_ID=$VAULT_SECONDARY_CLUSTER_ID"
-
-    - |
       echo "=== Assume AWS Role via OIDC ==="
       aws_sts_output="$(aws sts assume-role-with-web-identity \
         --role-arn "${STAGE_ROLE_ARN}" \
@@ -180,43 +154,9 @@ controlled-failover:
   script:
     - |
       echo "=== Encode controlled failover script ==="
-      if [ ! -f "scripts/controlled_failover_no_ca.py" ]; then
-        echo "ERROR: scripts/controlled_failover_no_ca.py not found"
-        exit 1
-      fi
-
+      test -f scripts/controlled_failover_no_ca.py
       SCRIPT_B64="$(base64 -w 0 scripts/controlled_failover_no_ca.py)"
       export SCRIPT_B64
-
-    - |
-      echo "=== Build remote SSM commands ==="
-      REMOTE_COMMANDS=$(cat <<EOF
-[
-  "set -euo pipefail",
-  "echo Running on bastion: \$(hostname)",
-  "mkdir -p /tmp/vault-controlled-failover",
-  "cd /tmp/vault-controlled-failover",
-  "cat <<'PYEOF' | base64 -d > controlled_failover_no_ca.py",
-  "${SCRIPT_B64}",
-  "PYEOF",
-  "chmod 700 controlled_failover_no_ca.py",
-  "export AWS_REGION='${AWS_REGION}'",
-  "export TARGET_ENV='${TARGET_ENV}'",
-  "export PRIMARY_REGION='${PRIMARY_REGION}'",
-  "export SECONDARY_REGION='${SECONDARY_REGION}'",
-  "export VAULT_PRIMARY_ADDR='${VAULT_PRIMARY_ADDR}'",
-  "export VAULT_SECONDARY_ADDR='${VAULT_SECONDARY_ADDR}'",
-  "export VAULT_PRIMARY_TOKEN_SECRET_ID='${VAULT_PRIMARY_TOKEN_SECRET_ID}'",
-  "export FAILOVER_TOKEN_SECRET_ID='${FAILOVER_TOKEN_SECRET_ID}'",
-  "export VAULT_TOKEN_JSON_KEY='${VAULT_TOKEN_JSON_KEY}'",
-  "export FAILOVER_TOKEN_JSON_KEY='${FAILOVER_TOKEN_JSON_KEY}'",
-  "export POST_PROMOTE_SLEEP_SECONDS='${POST_PROMOTE_SLEEP_SECONDS}'",
-  "export RUN_MODE='${RUN_MODE}'",
-  "python3 controlled_failover_no_ca.py"
-]
-EOF
-)
-      export REMOTE_COMMANDS
 
     - |
       echo "=== Send SSM command ==="
@@ -224,7 +164,29 @@ EOF
         --region "$AWS_REGION" \
         --instance-ids "$BASTION_INSTANCE_ID" \
         --document-name "AWS-RunShellScript" \
-        --parameters commands="$REMOTE_COMMANDS" \
+        --parameters commands="[
+          \"set -euo pipefail\",
+          \"echo Running on bastion: \$(hostname)\",
+          \"mkdir -p /tmp/vault-controlled-failover\",
+          \"cd /tmp/vault-controlled-failover\",
+          \"cat <<'EOF' | base64 -d > controlled_failover_no_ca.py\",
+          \"$SCRIPT_B64\",
+          \"EOF\",
+          \"chmod 700 controlled_failover_no_ca.py\",
+          \"export AWS_REGION='$AWS_REGION'\",
+          \"export TARGET_ENV='$TARGET_ENV'\",
+          \"export PRIMARY_REGION='$PRIMARY_REGION'\",
+          \"export SECONDARY_REGION='$SECONDARY_REGION'\",
+          \"export VAULT_PRIMARY_ADDR='$VAULT_PRIMARY_ADDR'\",
+          \"export VAULT_SECONDARY_ADDR='$VAULT_SECONDARY_ADDR'\",
+          \"export VAULT_PRIMARY_TOKEN_SECRET_ID='$VAULT_PRIMARY_TOKEN_SECRET_ID'\",
+          \"export FAILOVER_TOKEN_SECRET_ID='$FAILOVER_TOKEN_SECRET_ID'\",
+          \"export VAULT_TOKEN_JSON_KEY='$VAULT_TOKEN_JSON_KEY'\",
+          \"export FAILOVER_TOKEN_JSON_KEY='$FAILOVER_TOKEN_JSON_KEY'\",
+          \"export POST_PROMOTE_SLEEP_SECONDS='$POST_PROMOTE_SLEEP_SECONDS'\",
+          \"export RUN_MODE='$RUN_MODE'\",
+          \"python3 controlled_failover_no_ca.py\"
+        ]" \
         --query "Command.CommandId" \
         --output text)
 
@@ -234,7 +196,6 @@ EOF
     - |
       echo "=== Wait for SSM execution ==="
       STATUS=""
-
       for i in $(seq 1 60); do
         STATUS=$(aws ssm get-command-invocation \
           --region "$AWS_REGION" \
