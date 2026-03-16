@@ -230,3 +230,236 @@ failover:
     - if: '$CI_PIPELINE_SOURCE == "web"'
       when: manual
     - when: never
+
+failback:
+  stage: failback
+  image: amazon/aws-cli:2.15.57
+  when: manual
+
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://gitlab.corp.zscaler.com
+
+  variables:
+    VAULT_TOKEN_JSON_KEY: "root_token"
+    FAILOVER_TOKEN_JSON_KEY: "token"
+    POST_PROMOTE_SLEEP_SECONDS: "8"
+    MIN_STEP_SLEEP_SECONDS: "2"
+    MAX_STEP_SLEEP_SECONDS: "5"
+    POST_UPDATE_SLEEP_SECONDS: "6"
+
+  before_script:
+    - set -euo pipefail
+    - yum -y install bash coreutils jq python3 >/dev/null 2>&1 || true
+    - aws --version
+    - python3 --version
+
+    - export TARGET_ENV="$[[ inputs.target_env ]]"
+    - export PRIMARY_REGION="$[[ inputs.primary_region ]]"
+    - export RUN_MODE="$[[ inputs.run_mode ]]"
+
+    - |
+      echo "=== Selected Inputs ==="
+      echo "TARGET_ENV=$TARGET_ENV"
+      echo "PRIMARY_REGION=$PRIMARY_REGION"
+      echo "RUN_MODE=$RUN_MODE"
+
+    - |
+      case "$TARGET_ENV" in
+        dev|nonprod|prod) ;;
+        *)
+          echo "ERROR: Unsupported TARGET_ENV=$TARGET_ENV"
+          exit 1
+          ;;
+      esac
+
+      case "$PRIMARY_REGION" in
+        us-west-2|us-east-1) ;;
+        *)
+          echo "ERROR: Unsupported PRIMARY_REGION=$PRIMARY_REGION"
+          exit 1
+          ;;
+      esac
+
+      case "$RUN_MODE" in
+        validate_only|execute) ;;
+        *)
+          echo "ERROR: Unsupported RUN_MODE=$RUN_MODE"
+          exit 1
+          ;;
+      esac
+
+    - |
+      echo "=== Resolve Region Mapping ==="
+      case "$PRIMARY_REGION" in
+        us-west-2)
+          export AWS_REGION="us-west-2"
+          export PRIMARY_REGION_SHORT="usw2"
+          export SECONDARY_REGION="us-east-1"
+          export SECONDARY_REGION_SHORT="use1"
+          export VAULT_SECONDARY_CLUSTER_ID="use1"
+          ;;
+        us-east-1)
+          export AWS_REGION="us-east-1"
+          export PRIMARY_REGION_SHORT="use1"
+          export SECONDARY_REGION="us-west-2"
+          export SECONDARY_REGION_SHORT="usw2"
+          export VAULT_SECONDARY_CLUSTER_ID="usw2"
+          ;;
+      esac
+
+    - |
+      echo "=== Derive Vault URLs and Secret IDs ==="
+      export VAULT_PRIMARY_ADDR="https://${PRIMARY_REGION_SHORT}.${TARGET_ENV}.vault.corp.zscaler.com:8200"
+      export VAULT_SECONDARY_ADDR="https://${SECONDARY_REGION_SHORT}.${TARGET_ENV}.vault.corp.zscaler.com:8200"
+
+      export VAULT_PRIMARY_TOKEN_SECRET_ID="vaas/${TARGET_ENV}/primary/root-token"
+      export FAILOVER_TOKEN_SECRET_ID="vaas/${TARGET_ENV}/dr/failover-token"
+
+    - |
+      echo "=== Resolve Bastion and Role Mapping ==="
+      case "${TARGET_ENV}:${PRIMARY_REGION}" in
+        "dev:us-west-2")
+          export STAGE_ROLE_ARN="arn:aws:iam::792014834907:role/gitlab-vaas-iac-role"
+          export BASTION_INSTANCE_ID="i-0957342a4e454e69e"
+          ;;
+
+        "dev:us-east-1")
+          export STAGE_ROLE_ARN="arn:aws:iam::792014834907:role/gitlab-vaas-iac-role"
+          export BASTION_INSTANCE_ID="i-REPLACE-DEV-USE1-BASTION"
+          ;;
+
+        "nonprod:us-west-2")
+          export STAGE_ROLE_ARN="arn:aws:iam::REPLACE_NONPROD_ACCOUNT_ID:role/gitlab-vaas-iac-role"
+          export BASTION_INSTANCE_ID="i-REPLACE-NONPROD-USW2-BASTION"
+          ;;
+
+        "nonprod:us-east-1")
+          export STAGE_ROLE_ARN="arn:aws:iam::REPLACE_NONPROD_ACCOUNT_ID:role/gitlab-vaas-iac-role"
+          export BASTION_INSTANCE_ID="i-REPLACE-NONPROD-USE1-BASTION"
+          ;;
+
+        "prod:us-west-2")
+          export STAGE_ROLE_ARN="arn:aws:iam::REPLACE_PROD_ACCOUNT_ID:role/gitlab-vaas-iac-role"
+          export BASTION_INSTANCE_ID="i-REPLACE-PROD-USW2-BASTION"
+          ;;
+
+        "prod:us-east-1")
+          export STAGE_ROLE_ARN="arn:aws:iam::REPLACE_PROD_ACCOUNT_ID:role/gitlab-vaas-iac-role"
+          export BASTION_INSTANCE_ID="i-REPLACE-PROD-USE1-BASTION"
+          ;;
+
+        *)
+          echo "ERROR: No mapping found for TARGET_ENV=$TARGET_ENV PRIMARY_REGION=$PRIMARY_REGION"
+          exit 1
+          ;;
+      esac
+
+    - |
+      echo "=== Assume AWS Role via OIDC ==="
+      aws_sts_output="$(aws sts assume-role-with-web-identity \
+        --role-arn "${STAGE_ROLE_ARN}" \
+        --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}-failback" \
+        --web-identity-token "${GITLAB_OIDC_TOKEN}" \
+        --duration-seconds 3600 \
+        --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+        --output text)"
+
+      export AWS_ACCESS_KEY_ID="$(echo "$aws_sts_output" | awk '{print $1}')"
+      export AWS_SECRET_ACCESS_KEY="$(echo "$aws_sts_output" | awk '{print $2}')"
+      export AWS_SESSION_TOKEN="$(echo "$aws_sts_output" | awk '{print $3}')"
+
+      aws sts get-caller-identity
+
+  script:
+    - |
+      echo "=== Encode failback script ==="
+      test -f scripts/failback.py
+      SCRIPT_B64="$(base64 -w 0 scripts/failback.py)"
+      export SCRIPT_B64
+
+    - |
+      echo "=== Send SSM command ==="
+      CMD_ID=$(aws ssm send-command \
+        --region "$AWS_REGION" \
+        --instance-ids "$BASTION_INSTANCE_ID" \
+        --document-name "AWS-RunShellScript" \
+        --parameters commands="[
+          \"set -euo pipefail\",
+          \"echo Running on bastion: \$(hostname)\",
+          \"mkdir -p /tmp/vault-failback\",
+          \"cd /tmp/vault-failback\",
+          \"cat <<'EOF' | base64 -d > failback.py\",
+          \"$SCRIPT_B64\",
+          \"EOF\",
+          \"chmod 700 failback.py\",
+          \"export AWS_REGION='$AWS_REGION'\",
+          \"export TARGET_ENV='$TARGET_ENV'\",
+          \"export PRIMARY_REGION='$PRIMARY_REGION'\",
+          \"export SECONDARY_REGION='$SECONDARY_REGION'\",
+          \"export VAULT_PRIMARY_ADDR='$VAULT_PRIMARY_ADDR'\",
+          \"export VAULT_SECONDARY_ADDR='$VAULT_SECONDARY_ADDR'\",
+          \"export VAULT_SECONDARY_CLUSTER_ID='$VAULT_SECONDARY_CLUSTER_ID'\",
+          \"export VAULT_PRIMARY_TOKEN_SECRET_ID='$VAULT_PRIMARY_TOKEN_SECRET_ID'\",
+          \"export FAILOVER_TOKEN_SECRET_ID='$FAILOVER_TOKEN_SECRET_ID'\",
+          \"export VAULT_TOKEN_JSON_KEY='$VAULT_TOKEN_JSON_KEY'\",
+          \"export FAILOVER_TOKEN_JSON_KEY='$FAILOVER_TOKEN_JSON_KEY'\",
+          \"export POST_PROMOTE_SLEEP_SECONDS='$POST_PROMOTE_SLEEP_SECONDS'\",
+          \"export MIN_STEP_SLEEP_SECONDS='$MIN_STEP_SLEEP_SECONDS'\",
+          \"export MAX_STEP_SLEEP_SECONDS='$MAX_STEP_SLEEP_SECONDS'\",
+          \"export POST_UPDATE_SLEEP_SECONDS='$POST_UPDATE_SLEEP_SECONDS'\",
+          \"export RUN_MODE='$RUN_MODE'\",
+          \"python3 failback.py\"
+        ]" \
+        --query "Command.CommandId" \
+        --output text)
+
+      echo "SSM Command ID: $CMD_ID"
+      export CMD_ID
+
+    - |
+      echo "=== Wait for SSM execution ==="
+      STATUS=""
+      for i in $(seq 1 60); do
+        STATUS=$(aws ssm get-command-invocation \
+          --region "$AWS_REGION" \
+          --command-id "$CMD_ID" \
+          --instance-id "$BASTION_INSTANCE_ID" \
+          --query Status \
+          --output text 2>/dev/null || true)
+
+        echo "Poll $i: Status=$STATUS"
+
+        if [[ "$STATUS" == "Success" || "$STATUS" == "Failed" || "$STATUS" == "TimedOut" || "$STATUS" == "Cancelled" ]]; then
+          break
+        fi
+
+        sleep 10
+      done
+
+    - |
+      echo "=== SSM STDOUT ==="
+      aws ssm get-command-invocation \
+        --region "$AWS_REGION" \
+        --command-id "$CMD_ID" \
+        --instance-id "$BASTION_INSTANCE_ID" \
+        --query StandardOutputContent \
+        --output text || true
+
+      echo "=== SSM STDERR ==="
+      aws ssm get-command-invocation \
+        --region "$AWS_REGION" \
+        --command-id "$CMD_ID" \
+        --instance-id "$BASTION_INSTANCE_ID" \
+        --query StandardErrorContent \
+        --output text || true
+
+      if [ "$STATUS" != "Success" ]; then
+        echo "SSM execution failed with status=$STATUS"
+        exit 1
+      fi
+
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: manual
+    - when: never
