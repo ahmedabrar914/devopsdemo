@@ -1,3 +1,36 @@
+resource "aws_security_group" "vault_batch_token_lambda" {
+  count       = var.enable_vault_batch_token_rotator ? 1 : 0
+  name        = "${var.name_prefix}-vault-batch-token-lambda-sg"
+  description = "Security group for Vault batch token rotator lambda"
+  vpc_id      = module.vpc.vpc_id
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "${var.name_prefix}-vault-batch-token-lambda-sg"
+    Env  = var.env
+  }
+}
+
+resource "aws_security_group_rule" "allow_lambda_to_vault_8200" {
+  count                    = var.enable_vault_batch_token_rotator ? 1 : 0
+  type                     = "ingress"
+  security_group_id        = var.vault_server_security_group_id
+  from_port                = 8200
+  to_port                  = 8200
+  protocol                 = "tcp"
+  source_security_group_id = aws_security_group.vault_batch_token_lambda[0].id
+  description              = "Allow Vault batch token lambda to reach Vault API"
+}
+
+
+
+
 module "sg" {
   source = "./modules/sg"
 
