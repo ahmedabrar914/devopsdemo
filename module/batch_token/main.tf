@@ -35,7 +35,7 @@ resource "aws_iam_role" "this" {
 
 data "aws_iam_policy_document" "this" {
   statement {
-    sid    = "ReadInputSecrets"
+    sid    = "ReadVaultSecrets"
     effect = "Allow"
 
     actions = [
@@ -114,8 +114,8 @@ resource "aws_cloudwatch_log_group" "this" {
 resource "aws_lambda_function" "this" {
   function_name = var.function_name
   role          = aws_iam_role.this.arn
-  runtime       = var.runtime
   handler       = "lambda_function.lambda_handler"
+  runtime       = var.runtime
   timeout       = var.timeout
   memory_size   = var.memory_size
 
