@@ -1,8 +1,8 @@
-variable "function_name" {
+variable "aws_region" {
   type = string
 }
 
-variable "aws_region" {
+variable "function_name" {
   type = string
 }
 
