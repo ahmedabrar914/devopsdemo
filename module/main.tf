@@ -1,3 +1,20 @@
+module "sg" {
+  source = "./modules/sg"
+
+  name_prefix = var.name_prefix
+  vpc_id      = module.vpc.vpc_id
+
+  # keep your existing sg module inputs here
+
+  enable_vault_batch_token_lambda_sg       = var.enable_vault_batch_token_rotator
+  vault_batch_token_lambda_egress_cidr_blocks = ["0.0.0.0/0"]
+
+  enable_lambda_to_vault_ingress_rule = var.enable_vault_batch_token_rotator
+
+  # Replace this with the ACTUAL vault SG ID source from your stack
+  vault_security_group_id = module.aws_vault_hvd.vault_security_group_id
+}
+
 module "vault_batch_token_rotator" {
   count  = var.enable_vault_batch_token_rotator ? 1 : 0
   source = "./modules/lambda_vault_batch_token_rotator"
@@ -32,6 +49,6 @@ module "vault_batch_token_rotator" {
   subnet_ids = module.vpc.private_subnet_ids
 
   security_group_ids = [
-    aws_security_group.vault_batch_token_lambda_sg.id
+    module.sg.vault_batch_token_lambda_sg_id
   ]
 }
