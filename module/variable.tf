@@ -86,7 +86,3 @@ variable "vault_batch_token_http_max_retries" {
   type    = string
   default = "3"
 }
-
-variable "vault_batch_token_security_group_ids" {
-  type = list(string)
-}
