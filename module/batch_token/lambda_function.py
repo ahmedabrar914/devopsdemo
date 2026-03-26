@@ -4,6 +4,7 @@ import base64
 import socket
 import datetime
 import logging
+import ssl
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -12,13 +13,21 @@ import botocore
 import urllib3
 from urllib3.util.retry import Retry
 
+# =========================================================
+# LOGGING
+# =========================================================
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 logger = logging.getLogger()
 logger.setLevel(LOG_LEVEL)
 
+# =========================================================
+# AWS CLIENTS
+# =========================================================
 secrets = boto3.client("secretsmanager")
 
-
+# =========================================================
+# ENVIRONMENT
+# =========================================================
 def get_required_env(name: str) -> str:
     value = os.environ.get(name, "").strip()
     if not value:
@@ -27,12 +36,10 @@ def get_required_env(name: str) -> str:
 
 
 VAULT_ADDR = get_required_env("VAULT_PRIMARY_ADDR").rstrip("/")
-VAULT_CA_SECRET_ID = get_required_env("VAULT_CA_SECRET_ID")
 VAULT_ROOT_TOKEN_SECRET_ID = get_required_env("VAULT_ROOT_TOKEN_SECRET_ID")
 ROTATED_TOKEN_SECRET_ID = get_required_env("ROTATED_TOKEN_SECRET_ID")
 
-VAULT_ROOT_TOKEN_JSON_KEY = os.environ.get("VAULT_ROOT_TOKEN_JSON_KEY", "root_token").strip()
-VAULT_CA_SECRET_JSON_KEY = os.environ.get("VAULT_CA_SECRET_JSON_KEY", "").strip()
+VAULT_ROOT_TOKEN_JSON_KEY = os.environ.get("VAULT_ROOT_TOKEN_JSON_KEY", "token").strip()
 
 POLICY_NAME = os.environ.get("POLICY_NAME", "dr-secondary-promotion").strip()
 ROLE_NAME = os.environ.get("ROLE_NAME", "failover-handler").strip()
@@ -42,9 +49,9 @@ HTTP_TIMEOUT_SECONDS = float(os.environ.get("HTTP_TIMEOUT_SECONDS", "10"))
 HTTP_CONNECT_TIMEOUT_SECONDS = float(os.environ.get("HTTP_CONNECT_TIMEOUT_SECONDS", "5"))
 HTTP_MAX_RETRIES = int(os.environ.get("HTTP_MAX_RETRIES", "3"))
 
-CA_PATH = "/tmp/vault-ca.pem"
-
-
+# =========================================================
+# CUSTOM EXCEPTIONS
+# =========================================================
 class AppError(Exception):
     def __init__(self, step: str, message: str, details: Optional[Dict[str, Any]] = None):
         self.step = step
@@ -63,12 +70,19 @@ class AppError(Exception):
         return json.dumps(self.to_dict())
 
 
+# =========================================================
+# HELPERS
+# =========================================================
 def mask_token(token: str) -> str:
     if not token:
         return "empty"
     if len(token) <= 8:
         return "***"
     return f"{token[:4]}...{token[-4:]}"
+
+
+def utc_now() -> str:
+    return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
 def parse_json_maybe(payload: str) -> Any:
@@ -78,6 +92,9 @@ def parse_json_maybe(payload: str) -> Any:
         return payload
 
 
+# =========================================================
+# SECRET HELPERS
+# =========================================================
 def get_secret(secret_id: str) -> str:
     try:
         resp = secrets.get_secret_value(SecretId=secret_id)
@@ -139,28 +156,9 @@ def load_root_token() -> str:
     return token
 
 
-def load_ca_to_tmp() -> None:
-    payload = get_secret(VAULT_CA_SECRET_ID)
-    pem = extract_value(payload, VAULT_CA_SECRET_JSON_KEY)
-
-    if "BEGIN CERTIFICATE" not in pem:
-        raise AppError(
-            step="load_ca_to_tmp",
-            message="CA secret does not look like a PEM certificate",
-            details={"secret_id": VAULT_CA_SECRET_ID},
-        )
-
-    try:
-        with open(CA_PATH, "w", encoding="utf-8") as f:
-            f.write(pem.strip() + "\n")
-    except Exception as e:
-        raise AppError(
-            step="load_ca_to_tmp",
-            message="Failed to write CA certificate to /tmp",
-            details={"path": CA_PATH, "error": str(e)},
-        ) from e
-
-
+# =========================================================
+# NETWORK / DNS VALIDATION
+# =========================================================
 def validate_vault_addr() -> Tuple[str, str]:
     parsed = urlparse(VAULT_ADDR)
     if parsed.scheme != "https":
@@ -196,6 +194,9 @@ def check_dns_resolution(host: str) -> None:
     logger.info("Vault host %s resolved successfully: %s", host, ip_list)
 
 
+# =========================================================
+# HTTP CLIENT
+# =========================================================
 def build_http_client() -> urllib3.PoolManager:
     retry = Retry(
         total=HTTP_MAX_RETRIES,
@@ -214,9 +215,11 @@ def build_http_client() -> urllib3.PoolManager:
         read=HTTP_TIMEOUT_SECONDS,
     )
 
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    logger.warning("Using insecure TLS mode without CA verification")
+
     return urllib3.PoolManager(
-        cert_reqs="CERT_REQUIRED",
-        ca_certs=CA_PATH,
+        cert_reqs="CERT_NONE",
         retries=retry,
         timeout=timeout,
     )
@@ -232,6 +235,9 @@ def get_http() -> urllib3.PoolManager:
     return HTTP
 
 
+# =========================================================
+# VAULT API
+# =========================================================
 def vault_request(
     method: str,
     path: str,
@@ -255,7 +261,11 @@ def vault_request(
         raise AppError(
             step="vault_request",
             message="HTTP request to Vault failed",
-            details={"method": method, "url": url, "error": str(e)},
+            details={
+                "method": method,
+                "url": url,
+                "error": str(e),
+            },
         ) from e
 
     raw_text = resp.data.decode("utf-8") if resp.data else ""
@@ -313,6 +323,9 @@ def check_vault_health() -> Dict[str, Any]:
     return {"http_status": resp.status, "response": data}
 
 
+# =========================================================
+# POLICY / ROLE
+# =========================================================
 POLICY_HCL = """
 path "sys/replication/dr/secondary/promote" {
   capabilities = ["update"]
@@ -340,7 +353,7 @@ def ensure_policy(root_token: str) -> bool:
         logger.info("Policy already exists: %s", POLICY_NAME)
         return True
 
-    vault_request(
+    _, _ = vault_request(
         "PUT",
         f"sys/policies/acl/{POLICY_NAME}",
         root_token,
@@ -370,7 +383,7 @@ def ensure_role(root_token: str) -> bool:
         "token_type": "batch",
     }
 
-    vault_request(
+    _, _ = vault_request(
         "POST",
         f"auth/token/roles/{ROLE_NAME}",
         root_token,
@@ -381,6 +394,9 @@ def ensure_role(root_token: str) -> bool:
     return False
 
 
+# =========================================================
+# CREATE BATCH TOKEN
+# =========================================================
 def create_batch_token(root_token: str) -> Tuple[str, str, int]:
     _, data = vault_request(
         "POST",
@@ -418,7 +434,10 @@ def create_batch_token(root_token: str) -> Tuple[str, str, int]:
     return client_token, accessor, lease_duration
 
 
-def store_rotated_token(token: str, accessor: str, ttl_seconds: int) -> str:
+# =========================================================
+# STORE TOKEN IN SECRETS MANAGER
+# =========================================================
+def store_rotated_token(token, accessor, ttl_seconds):
     created_at = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
     kv_payload = {
@@ -426,9 +445,9 @@ def store_rotated_token(token: str, accessor: str, ttl_seconds: int) -> str:
         "token_accessor": accessor or "n/a",
         "token_duration": BATCH_TOKEN_TTL,
         "token_renewable": "false",
-        "token_policies": f"[\"default\",\"{POLICY_NAME}\"]",
+        "token_policies": f'["default","{POLICY_NAME}"]',
         "identity_policies": "[]",
-        "policies": f"[\"default\",\"{POLICY_NAME}\"]",
+        "policies": f'["default","{POLICY_NAME}"]',
         "created_at": created_at
     }
 
@@ -440,11 +459,12 @@ def store_rotated_token(token: str, accessor: str, ttl_seconds: int) -> str:
     return created_at
 
 
+# =========================================================
+# HANDLER
+# =========================================================
 def lambda_handler(event, context):
     host, _ = validate_vault_addr()
     check_dns_resolution(host)
-    load_ca_to_tmp()
-    check_vault_health()
 
     root_token = load_root_token()
 
