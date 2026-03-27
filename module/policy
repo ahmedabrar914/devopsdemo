@@ -1,0 +1,57 @@
+# --- Namespace management (create/delete/list namespaces) ---
+path "sys/namespaces/*" {
+  capabilities = ["create","read","update","delete","list","sudo"]
+}
+
+# --- Within namespaces: manage mounts (KV) ---
+path "sys/mounts" {
+  capabilities = ["read","list"]
+}
+path "sys/mounts/*" {
+  capabilities = ["create","read","update","delete","list","sudo"]
+}
+
+# Full access to everything else
+path "*" {
+  capabilities = ["create", "read", "update", "delete", "list", "sudo"]
+}
+
+# Full access to everything else
+path "sys/namespaces" {
+  capabilities = ["create", "read", "update", "delete", "list", "sudo"]
+}
+
+# Full access to everything else
+path "sys/internal/ui/mounts" {
+  capabilities = ["create", "read", "update", "delete", "list", "sudo"]
+}
+
+# --- Within namespaces: manage auth methods (Okta enable/config) ---
+path "sys/auth" {
+  capabilities = ["read","list"]
+}
+path "sys/auth/*" {
+  capabilities = ["create","read","update","delete","list","sudo"]
+}
+
+# --- Within namespaces: manage ACL policies ---
+path "sys/policies/acl" {
+  capabilities = ["create", "read", "update", "delete", "list", "sudo"]
+}
+path "sys/policies/acl/*" {
+  capabilities = ["create","read","update","delete","list","sudo"]
+}
+
+# Allow creating tokens for operations inside namespaces
+path "auth/token/create" {
+  capabilities = ["create","update","sudo"]
+}
+path "auth/token/create/*" {
+  capabilities = ["create","update","sudo"]
+}
+path "auth/token/lookup-self" {
+  capabilities = ["read"]
+}
+path "auth/token/renew-self" {
+  capabilities = ["update"]
+}
