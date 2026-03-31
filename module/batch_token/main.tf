@@ -11,8 +11,8 @@ terraform {
 
 data "archive_file" "lambda_zip" {
   type        = "zip"
-  source_file = "${path.module}/lambda_src/lambda_function.py"
-  output_path = "${path.module}/lambda_src/lambda_function.zip"
+  source_file = "${path.module}/lambda_src/${var.lambda_source_file}"
+  output_path = "${path.module}/lambda_src/${var.lambda_output_zip}"
 }
 
 data "aws_iam_policy_document" "lambda_assume_role" {
@@ -113,7 +113,7 @@ resource "aws_cloudwatch_log_group" "this" {
 resource "aws_lambda_function" "this" {
   function_name = var.function_name
   role          = aws_iam_role.this.arn
-  handler       = "lambda_function.lambda_handler"
+  handler       = var.handler
   runtime       = var.runtime
   timeout       = var.timeout
   memory_size   = var.memory_size
@@ -130,6 +130,9 @@ resource "aws_lambda_function" "this" {
     variables = {
       LOG_LEVEL                    = var.log_level
       BATCH_TOKEN_TTL              = var.batch_token_ttl
+      ADMIN_TOKEN_TTL              = var.admin_token_ttl
+      TOKEN_RENEWABLE              = var.token_renewable
+      TOKEN_EXPLICIT_MAX_TTL       = var.token_explicit_max_ttl
       ROTATED_TOKEN_SECRET_ID      = var.rotated_token_secret_id
       VAULT_PRIMARY_ADDR           = var.vault_primary_addr
       VAULT_ROOT_TOKEN_JSON_KEY    = var.vault_root_token_json_key
