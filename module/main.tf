@@ -83,3 +83,97 @@ module "vault_batch_token_rotator" {
     module.vault_core[0].vault_sg_id
   ]
 }
+
+##admin
+
+
+module "vault_admin_token_rotator" {
+  count  = var.enable_vault_admin_token_rotator ? 1 : 0
+  source = "./modules/lambda"
+
+  aws_region    = var.region
+  function_name = var.vault_admin_token_rotator_function_name
+
+  runtime     = var.vault_admin_token_rotator_runtime
+  timeout     = var.vault_admin_token_rotator_timeout
+  memory_size = var.vault_admin_token_rotator_memory_size
+
+  log_level             = var.vault_admin_token_rotator_log_level
+  log_retention_in_days = var.vault_admin_token_rotator_log_retention_in_days
+  schedule_expression   = var.vault_admin_token_schedule_expression
+
+  lambda_source_file = "admin_token_lambda.py"
+  lambda_output_zip  = "admin_token_lambda.zip"
+  handler            = "admin_token_lambda.lambda_handler"
+
+  vault_primary_addr         = "https://${var.vault_fqdn}:8200"
+  vault_root_token_secret_id = var.vault_root_token_secret_id
+  rotated_token_secret_id    = var.admin_rotated_token_secret_id
+
+  vault_root_token_json_key = var.vault_root_token_json_key
+
+  policy_name = var.vault_admin_token_policy_name
+  role_name   = var.vault_admin_token_role_name
+
+  batch_token_ttl = ""
+  admin_token_ttl = var.vault_admin_token_ttl
+
+  token_renewable        = var.vault_admin_token_renewable
+  token_explicit_max_ttl = var.vault_admin_token_explicit_max_ttl
+
+  http_timeout_seconds         = var.vault_admin_token_http_timeout_seconds
+  http_connect_timeout_seconds = var.vault_admin_token_http_connect_timeout_seconds
+  http_max_retries             = var.vault_admin_token_http_max_retries
+
+  subnet_ids = module.vault_vpc.private_subnet_ids
+
+  security_group_ids = [
+    module.vault_core[0].vault_sg_id
+  ]
+}
+
+#update
+
+module "vault_batch_token_rotator" {
+  count  = var.enable_vault_batch_token_rotator ? 1 : 0
+  source = "./modules/lambda"
+
+  aws_region    = var.region
+  function_name = var.vault_batch_token_rotator_function_name
+
+  runtime     = var.vault_batch_token_rotator_runtime
+  timeout     = var.vault_batch_token_rotator_timeout
+  memory_size = var.vault_batch_token_rotator_memory_size
+
+  log_level             = var.vault_batch_token_rotator_log_level
+  log_retention_in_days = var.vault_batch_token_rotator_log_retention_in_days
+  schedule_expression   = var.vault_batch_token_schedule_expression
+
+  lambda_source_file = "batch_token_lambda.py"
+  lambda_output_zip  = "batch_token_lambda.zip"
+  handler            = "batch_token_lambda.lambda_handler"
+
+  vault_primary_addr         = "https://${var.vault_fqdn}:8200"
+  vault_root_token_secret_id = var.vault_root_token_secret_id
+  rotated_token_secret_id    = var.rotated_token_secret_id
+
+  vault_root_token_json_key = var.vault_root_token_json_key
+
+  policy_name     = var.vault_batch_token_policy_name
+  role_name       = var.vault_batch_token_role_name
+  batch_token_ttl = var.vault_batch_token_ttl
+
+  admin_token_ttl         = ""
+  token_renewable         = "false"
+  token_explicit_max_ttl  = ""
+
+  http_timeout_seconds         = var.vault_batch_token_http_timeout_seconds
+  http_connect_timeout_seconds = var.vault_batch_token_http_connect_timeout_seconds
+  http_max_retries             = var.vault_batch_token_http_max_retries
+
+  subnet_ids = module.vault_vpc.private_subnet_ids
+
+  security_group_ids = [
+    module.vault_core[0].vault_sg_id
+  ]
+}
