@@ -50,7 +50,7 @@ module "sg" {
 
 module "vault_batch_token_rotator" {
   count  = var.enable_vault_batch_token_rotator ? 1 : 0
-  source = "./modules/lambda_vault_batch_token_rotator"
+  source = "./modules/lambda"
 
   aws_region    = var.region
   function_name = var.vault_batch_token_rotator_function_name
@@ -64,12 +64,10 @@ module "vault_batch_token_rotator" {
   schedule_expression   = var.vault_batch_token_schedule_expression
 
   vault_primary_addr         = "https://${var.vault_fqdn}:8200"
-  vault_ca_secret_id         = var.sm_vault_tls_ca_bundle
   vault_root_token_secret_id = var.vault_root_token_secret_id
   rotated_token_secret_id    = var.rotated_token_secret_id
 
   vault_root_token_json_key = var.vault_root_token_json_key
-  vault_ca_secret_json_key  = var.vault_ca_secret_json_key
 
   policy_name     = var.vault_batch_token_policy_name
   role_name       = var.vault_batch_token_role_name
@@ -79,9 +77,9 @@ module "vault_batch_token_rotator" {
   http_connect_timeout_seconds = var.vault_batch_token_http_connect_timeout_seconds
   http_max_retries             = var.vault_batch_token_http_max_retries
 
-  subnet_ids = module.vpc.private_subnet_ids
+  subnet_ids = module.vault_vpc.private_subnet_ids
 
   security_group_ids = [
-    module.sg.vault_batch_token_lambda_sg_id
+    module.vault_core[0].vault_sg_id
   ]
 }
