@@ -44,7 +44,6 @@ data "aws_iam_policy_document" "this" {
     ]
 
     resources = [
-      var.vault_ca_secret_id,
       var.vault_root_token_secret_id
     ]
   }
@@ -132,11 +131,9 @@ resource "aws_lambda_function" "this" {
       LOG_LEVEL                    = var.log_level
       BATCH_TOKEN_TTL              = var.batch_token_ttl
       ROTATED_TOKEN_SECRET_ID      = var.rotated_token_secret_id
-      VAULT_CA_SECRET_ID           = var.vault_ca_secret_id
       VAULT_PRIMARY_ADDR           = var.vault_primary_addr
       VAULT_ROOT_TOKEN_JSON_KEY    = var.vault_root_token_json_key
       VAULT_ROOT_TOKEN_SECRET_ID   = var.vault_root_token_secret_id
-      VAULT_CA_SECRET_JSON_KEY     = var.vault_ca_secret_json_key
       POLICY_NAME                  = var.policy_name
       ROLE_NAME                    = var.role_name
       HTTP_TIMEOUT_SECONDS         = var.http_timeout_seconds
