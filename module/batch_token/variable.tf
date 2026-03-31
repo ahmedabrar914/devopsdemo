@@ -95,3 +95,30 @@ variable "schedule_expression" {
   type    = string
   default = null
 }
+
+variable "lambda_source_file" {
+  type = string
+}
+
+variable "lambda_output_zip" {
+  type = string
+}
+
+variable "handler" {
+  type = string
+}
+
+variable "admin_token_ttl" {
+  type    = string
+  default = ""
+}
+
+variable "token_renewable" {
+  type    = string
+  default = "true"
+}
+
+variable "token_explicit_max_ttl" {
+  type    = string
+  default = ""
+}
