@@ -33,10 +33,6 @@ variable "vault_primary_addr" {
   type = string
 }
 
-variable "vault_ca_secret_id" {
-  type = string
-}
-
 variable "vault_root_token_secret_id" {
   type = string
 }
