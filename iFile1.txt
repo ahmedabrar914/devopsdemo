@@ -1,1 +1,114 @@
-demo test
+# Bastion host resources for accessing App Connector instances
+
+# Get latest Amazon Linux 2023 AMI
+data "aws_ssm_parameter" "amazon_linux_latest" {
+  name = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
+}
+
+# Security group for bastion host
+resource "aws_security_group" "bastion_sg" {
+  name        = "${var.name_prefix}-bastion-sg"
+  description = "Security group for bastion host with SSM access"
+  vpc_id      = var.vpc_id
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow all outbound traffic"
+  }
+
+  tags = merge(
+    var.tags,
+    {
+      Name = "${var.name_prefix}-bastion-sg"
+      Owner = var.owner_tag
+    }
+  )
+}
+
+# IAM role for bastion host
+resource "aws_iam_role" "bastion_role" {
+  name = "${var.name_prefix}-bastion-role"
+  
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Action = "sts:AssumeRole",
+      Principal = {
+        Service = "ec2.amazonaws.com"
+      },
+      Effect = "Allow",
+      Sid = ""
+    }]
+  })
+
+  tags = merge(
+    var.tags,
+    {
+      Name = "${var.name_prefix}-bastion-role"
+      Owner = var.owner_tag
+    }
+  )
+}
+
+# Attach SSM policy to bastion role
+resource "aws_iam_role_policy_attachment" "bastion_ssm_policy" {
+  role       = aws_iam_role.bastion_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+# Create instance profile for bastion
+resource "aws_iam_instance_profile" "bastion_profile" {
+  name = "${var.name_prefix}-bastion-profile"
+  role = aws_iam_role.bastion_role.name
+  
+  tags = merge(
+    var.tags,
+    {
+      Name = "${var.name_prefix}-bastion-profile"
+      Owner = var.owner_tag
+    }
+  )
+}
+
+# Bastion host EC2 instance
+resource "aws_instance" "bastion" {
+  ami                    = data.aws_ssm_parameter.amazon_linux_latest.value
+  instance_type          = var.bastion_instance_type
+  subnet_id              = var.bastion_subnet_id
+  vpc_security_group_ids = [aws_security_group.bastion_sg.id]
+  key_name               = var.bastion_key_name
+  iam_instance_profile   = aws_iam_instance_profile.bastion_profile.name
+  
+  # Enable IMDSv2
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
+  }
+  
+  root_block_device {
+    volume_type           = "gp3"
+    volume_size           = 10
+    delete_on_termination = true
+    encrypted             = true
+    
+    tags = merge(
+      var.tags,
+      {
+        Name = "${var.name_prefix}-bastion-root"
+        Owner = var.owner_tag
+      }
+    )
+  }
+  
+  tags = merge(
+    var.tags,
+    {
+      Name = "${var.name_prefix}-bastion"
+      Owner = var.owner_tag
+    }
+  )
+}
