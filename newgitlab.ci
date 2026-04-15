@@ -24,8 +24,8 @@ spec:
 
 workflow:
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
     - when: never
 
@@ -51,15 +51,9 @@ stages:
   - notify
 
 variables:
-  SECRET_DETECTION_ENABLED: "true"
-  STAGE_ROLE_ARN: "arn:aws:iam::792014834907:role/gitlab-vaas-iac-role"
-  PROD_ROLE_ARN: "arn:aws:iam::100828516796:role/gitlab-vaas-iac-role"
-  TF_IN_AUTOMATION: "true"
-  TF_INPUT: "false"
-  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
-
-include:
-  - template: Security/Secret-Detection.gitlab-ci.yml
+  SECRET_DETECTION_ENABLED: 'true'
+  STAGE_ROLE_ARN: arn:aws:iam::792014834907:role/gitlab-vaas-iac-role
+  PROD_ROLE_ARN: arn:aws:iam::100828516796:role/gitlab-vaas-iac-role
 
 secret_detection:
   stage: secret-detection
@@ -69,114 +63,73 @@ secret_detection:
     - if: '$CI_PIPELINE_SOURCE == "web"'
       when: never
 
+include:
+  - template: Security/Secret-Detection.gitlab-ci.yml
+
 # -------------------------------------------------------
-# Change anchors
+# Root terraform changes
+# If these files change, all plan jobs should run
 # -------------------------------------------------------
-.root_changes: &root_changes
+.root_tf_changes: &root_tf_changes
   changes:
     - "*.tf"
     - "*.tf.json"
-    - ".gitlab-ci.yml"
     - modules/**/*
     - shared/**/*
 
-.dev_usw2_changes: &dev_usw2_changes
-  changes:
-    - environments/dev/primary/us-west-2/**/*
-
-.dev_use1_changes: &dev_use1_changes
-  changes:
-    - environments/dev/dr/us-east-1/**/*
-
-.nonprod_usw2_changes: &nonprod_usw2_changes
-  changes:
-    - environments/nonprod/us-west-2/**/*
-
-.nonprod_use1_changes: &nonprod_use1_changes
-  changes:
-    - environments/nonprod/us-east-1/**/*
-
 # -------------------------------------------------------
-# OIDC -> Assume Role
+# Assume role blocks
 # -------------------------------------------------------
-.assume_aws_role: &assume_aws_role
+.assume_aws_stage_role: &assume_aws_stage_role
   - |
-    set -euo pipefail
-
-    if [ -z "${AWS_ROLE_ARN:-}" ]; then
-      echo "ERROR: AWS_ROLE_ARN is not set for this job"
-      exit 1
-    fi
-
-    if [ -z "${GITLAB_OIDC_TOKEN:-}" ]; then
-      echo "ERROR: GITLAB_OIDC_TOKEN is not available"
-      exit 1
-    fi
-
-    echo "Assuming role: ${AWS_ROLE_ARN}"
     aws_sts_output=$(aws sts assume-role-with-web-identity \
-      --role-arn "${AWS_ROLE_ARN}" \
-      --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}-${CI_JOB_ID}" \
-      --web-identity-token "${GITLAB_OIDC_TOKEN}" \
+      --role-arn ${STAGE_ROLE_ARN} \
+      --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}" \
+      --web-identity-token ${GITLAB_OIDC_TOKEN} \
       --duration-seconds 3600 \
       --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
       --output text)
+    export $(printf "AWS_ACCESS_KEY_ID=%s AWS_SECRET_ACCESS_KEY=%s AWS_SESSION_TOKEN=%s" $aws_sts_output)
+    echo "Assumed AWS role ${STAGE_ROLE_ARN}"
+    aws sts get-caller-identity
 
-    export AWS_ACCESS_KEY_ID="$(echo "${aws_sts_output}" | awk '{print $1}')"
-    export AWS_SECRET_ACCESS_KEY="$(echo "${aws_sts_output}" | awk '{print $2}')"
-    export AWS_SESSION_TOKEN="$(echo "${aws_sts_output}" | awk '{print $3}')"
-
-    echo "Caller identity:"
+.assume_aws_prod_role: &assume_aws_prod_role
+  - |
+    aws_sts_output=$(aws sts assume-role-with-web-identity \
+      --role-arn ${PROD_ROLE_ARN} \
+      --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}" \
+      --web-identity-token ${GITLAB_OIDC_TOKEN} \
+      --duration-seconds 3600 \
+      --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+      --output text)
+    export $(printf "AWS_ACCESS_KEY_ID=%s AWS_SECRET_ACCESS_KEY=%s AWS_SESSION_TOKEN=%s" $aws_sts_output)
+    echo "Assumed AWS role ${PROD_ROLE_ARN}"
     aws sts get-caller-identity
 
 # -------------------------------------------------------
-# Common terraform base
-# -------------------------------------------------------
-.terraform_base:
-  image: hashicorp/terraform:1.12.2
-  variables:
-    KUBERNETES_POD_LABELS_INTERNET_ALLOW: "internet=allow"
-  id_tokens:
-    GITLAB_OIDC_TOKEN:
-      aud: https://gitlab.corp.zscaler.com
-  cache:
-    key: "${CI_JOB_NAME}"
-    paths:
-      - .cache/pip
-  before_script:
-    - apk update
-    - apk add --no-cache bash python3 py3-pip jq
-    - pip3 install --no-cache-dir awscli
-    - aws --version
-    - terraform version
-    - *assume_aws_role
-
-# -------------------------------------------------------
-# Validation jobs
+# Validate if branch is rebased
 # -------------------------------------------------------
 check-rebased:
   stage: validate
   image: alpine/git:latest
   script:
     - |
-      set -e
-
-      if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
-        echo "On default branch, continuing pipeline"
+      if [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        echo "On main branch, continuing pipeline"
         exit 0
       fi
 
-      git fetch origin "$CI_DEFAULT_BRANCH"
+      git fetch origin main
 
-      MERGE_BASE=$(git merge-base HEAD "origin/$CI_DEFAULT_BRANCH")
-      MAIN_HEAD=$(git rev-parse "origin/$CI_DEFAULT_BRANCH")
+      MERGE_BASE=$(git merge-base HEAD origin/main)
+      MAIN_HEAD=$(git rev-parse origin/main)
 
       if [ "$MERGE_BASE" != "$MAIN_HEAD" ]; then
-        echo "ERROR: Branch $CI_COMMIT_BRANCH is not rebased on $CI_DEFAULT_BRANCH"
-        echo "Please rebase your branch before pushing"
+        echo "ERROR: Branch $CI_COMMIT_BRANCH is not rebased on main!"
+        echo "Please rebase your branch before pushing."
         exit 1
       else
-        echo "Branch is properly rebased on $CI_DEFAULT_BRANCH"
+        echo "Branch is properly rebased on main, continuing pipeline"
       fi
   allow_failure: true
   rules:
@@ -189,10 +142,12 @@ terraform-format-check:
   stage: terraform-format-check
   image: hashicorp/terraform:1.12.2
   script:
-    - |
-      set -e
-      echo "Checking Terraform formatting..."
-      terraform fmt -check -recursive
+    - echo "Checking Terraform formatting..."
+    - if ! terraform fmt -check; then
+        echo "The following files failed formatting:";
+        terraform fmt -check;
+        exit 1;
+      fi
   allow_failure: false
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
@@ -218,219 +173,299 @@ terraform-scan:
       when: never
 
 # -------------------------------------------------------
-# Terraform plan/apply templates
-# -------------------------------------------------------
-.terraform_plan_template:
-  extends: .terraform_base
-  stage: plan
-  needs:
-    - terraform-scan
-  script:
-    - |
-      set -euo pipefail
-
-      echo "CI_JOB_NAME=${CI_JOB_NAME}"
-      echo "ENV_DIR=${ENV_DIR}"
-      echo "TFVARS_FILE=${TFVARS_FILE}"
-      echo "AWS_ROLE_ARN=${AWS_ROLE_ARN}"
-
-      test -f "${ENV_DIR}/backend.tf"
-      test -f "${TFVARS_FILE}"
-
-      cp "${ENV_DIR}/backend.tf" ./backend.tf
-
-      echo "Running terraform init..."
-      terraform init
-
-      echo "Running terraform validate..."
-      terraform validate
-
-      echo "Running terraform plan..."
-      terraform plan -out="tfplan-${CI_JOB_NAME}.tfplan" -var-file="${TFVARS_FILE}"
-
-      echo "Generated plan artifact:"
-      ls -l "tfplan-${CI_JOB_NAME}.tfplan"
-  artifacts:
-    when: always
-    paths:
-      - "tfplan-${CI_JOB_NAME}.tfplan"
-      - "status_${CI_JOB_NAME}.txt"
-    expire_in: 1 day
-  after_script:
-    - echo "$CI_JOB_STATUS" > "status_${CI_JOB_NAME}.txt"
-
-.terraform_apply_template:
-  extends: .terraform_base
-  stage: apply
-  script:
-    - |
-      set -euo pipefail
-
-      echo "CI_JOB_NAME=${CI_JOB_NAME}"
-      echo "ENV_DIR=${ENV_DIR}"
-      echo "TFVARS_FILE=${TFVARS_FILE}"
-      echo "AWS_ROLE_ARN=${AWS_ROLE_ARN}"
-
-      test -f "${ENV_DIR}/backend.tf"
-      test -f "${TFVARS_FILE}"
-
-      cp "${ENV_DIR}/backend.tf" ./backend.tf
-
-      echo "Running terraform init..."
-      terraform init
-
-      echo "Running terraform apply..."
-      terraform apply -auto-approve -var-file="${TFVARS_FILE}"
-  artifacts:
-    when: always
-    paths:
-      - "status_${CI_JOB_NAME}.txt"
-    expire_in: 1 day
-  after_script:
-    - echo "$CI_JOB_STATUS" > "status_${CI_JOB_NAME}.txt"
-
-# -------------------------------------------------------
 # DEV plan jobs
 # -------------------------------------------------------
 dev_plan_usw2:
-  extends: .terraform_plan_template
+  image: hashicorp/terraform:1.12.2
+  stage: plan
   variables:
-    AWS_ROLE_ARN: "$STAGE_ROLE_ARN"
-    ENV_DIR: "environments/dev/primary/us-west-2"
-    TFVARS_FILE: "environments/dev/primary/us-west-2/parameters.primary.tfvars"
+    KUBERNETES_POD_LABELS_INTERNET_ALLOW: "internet=allow"
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://gitlab.corp.zscaler.com
+  before_script:
+    - apk update
+    - apk add --no-cache aws-cli bash
+    - *assume_aws_stage_role
+  script:
+    - test -f "./environments/dev/primary/us-west-2/backend.tf"
+    - test -f "./environments/dev/primary/us-west-2/parameters.primary.tfvars"
+    - cp ./environments/dev/primary/us-west-2/backend.tf ./backend.tf
+    - terraform init
+    - terraform validate
+    - echo "Planning DEV us-west-2"
+    - terraform plan -out=tfplan-dev_plan_usw2.tfplan -var-file="./environments/dev/primary/us-west-2/parameters.primary.tfvars"
+  needs:
+    - terraform-scan
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      <<: *dev_usw2_changes
+      changes:
+        - environments/dev/primary/us-west-2/**/*
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-      <<: *dev_usw2_changes
+      changes:
+        - environments/dev/primary/us-west-2/**/*
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      <<: *root_changes
+      <<: *root_tf_changes
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-      <<: *root_changes
+      <<: *root_tf_changes
     - when: never
+  artifacts:
+    when: always
+    paths:
+      - tfplan-dev_plan_usw2.tfplan
+      - status_dev_plan_usw2.txt
+    expire_in: 1 day
+  after_script:
+    - echo "$CI_JOB_STATUS" > status_dev_plan_usw2.txt
 
 dev_plan_use1:
-  extends: .terraform_plan_template
+  image: hashicorp/terraform:1.12.2
+  stage: plan
   variables:
-    AWS_ROLE_ARN: "$STAGE_ROLE_ARN"
-    ENV_DIR: "environments/dev/dr/us-east-1"
-    TFVARS_FILE: "environments/dev/dr/us-east-1/parameters.dr.tfvars"
+    KUBERNETES_POD_LABELS_INTERNET_ALLOW: "internet=allow"
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://gitlab.corp.zscaler.com
+  before_script:
+    - apk update
+    - apk add --no-cache aws-cli bash
+    - *assume_aws_stage_role
+  script:
+    - test -f "./environments/dev/dr/us-east-1/backend.tf"
+    - test -f "./environments/dev/dr/us-east-1/parameters.dr.tfvars"
+    - cp ./environments/dev/dr/us-east-1/backend.tf ./backend.tf
+    - terraform init
+    - terraform validate
+    - echo "Planning DEV us-east-1"
+    - terraform plan -out=tfplan-dev_plan_use1.tfplan -var-file="./environments/dev/dr/us-east-1/parameters.dr.tfvars"
+  needs:
+    - terraform-scan
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      <<: *dev_use1_changes
+      changes:
+        - environments/dev/dr/us-east-1/**/*
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-      <<: *dev_use1_changes
+      changes:
+        - environments/dev/dr/us-east-1/**/*
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      <<: *root_changes
+      <<: *root_tf_changes
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-      <<: *root_changes
+      <<: *root_tf_changes
     - when: never
+  artifacts:
+    when: always
+    paths:
+      - tfplan-dev_plan_use1.tfplan
+      - status_dev_plan_use1.txt
+    expire_in: 1 day
+  after_script:
+    - echo "$CI_JOB_STATUS" > status_dev_plan_use1.txt
 
 # -------------------------------------------------------
 # NONPROD plan jobs
 # -------------------------------------------------------
 nonprod_plan_usw2:
-  extends: .terraform_plan_template
+  image: hashicorp/terraform:1.12.2
+  stage: plan
   variables:
-    AWS_ROLE_ARN: "$PROD_ROLE_ARN"
-    ENV_DIR: "environments/nonprod/us-west-2"
-    TFVARS_FILE: "environments/nonprod/us-west-2/parameters.usw2-nonprod.tfvars"
+    KUBERNETES_POD_LABELS_INTERNET_ALLOW: "internet=allow"
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://gitlab.corp.zscaler.com
+  before_script:
+    - apk update
+    - apk add --no-cache aws-cli bash
+    - *assume_aws_prod_role
+  script:
+    - test -f "./environments/nonprod/us-west-2/backend.tf"
+    - test -f "./environments/nonprod/us-west-2/parameters.usw2-nonprod.tfvars"
+    - cp ./environments/nonprod/us-west-2/backend.tf ./backend.tf
+    - terraform init
+    - terraform validate
+    - echo "Planning NONPROD us-west-2"
+    - terraform plan -out=tfplan-nonprod_plan_usw2.tfplan -var-file="./environments/nonprod/us-west-2/parameters.usw2-nonprod.tfvars"
+  needs:
+    - terraform-scan
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      <<: *nonprod_usw2_changes
+      changes:
+        - environments/nonprod/us-west-2/**/*
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-      <<: *nonprod_usw2_changes
+      changes:
+        - environments/nonprod/us-west-2/**/*
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      <<: *root_changes
+      <<: *root_tf_changes
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-      <<: *root_changes
+      <<: *root_tf_changes
     - when: never
+  artifacts:
+    when: always
+    paths:
+      - tfplan-nonprod_plan_usw2.tfplan
+      - status_nonprod_plan_usw2.txt
+    expire_in: 1 day
+  after_script:
+    - echo "$CI_JOB_STATUS" > status_nonprod_plan_usw2.txt
 
 nonprod_plan_use1:
-  extends: .terraform_plan_template
+  image: hashicorp/terraform:1.12.2
+  stage: plan
   variables:
-    AWS_ROLE_ARN: "$PROD_ROLE_ARN"
-    ENV_DIR: "environments/nonprod/us-east-1"
-    TFVARS_FILE: "environments/nonprod/us-east-1/parameters.dr.tfvars"
+    KUBERNETES_POD_LABELS_INTERNET_ALLOW: "internet=allow"
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://gitlab.corp.zscaler.com
+  before_script:
+    - apk update
+    - apk add --no-cache aws-cli bash
+    - *assume_aws_prod_role
+  script:
+    - test -f "./environments/nonprod/us-east-1/backend.tf"
+    - test -f "./environments/nonprod/us-east-1/parameters.dr.tfvars"
+    - cp ./environments/nonprod/us-east-1/backend.tf ./backend.tf
+    - terraform init
+    - terraform validate
+    - echo "Planning NONPROD us-east-1"
+    - terraform plan -out=tfplan-nonprod_plan_use1.tfplan -var-file="./environments/nonprod/us-east-1/parameters.dr.tfvars"
+  needs:
+    - terraform-scan
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      <<: *nonprod_use1_changes
+      changes:
+        - environments/nonprod/us-east-1/**/*
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-      <<: *nonprod_use1_changes
+      changes:
+        - environments/nonprod/us-east-1/**/*
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      <<: *root_changes
+      <<: *root_tf_changes
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-      <<: *root_changes
+      <<: *root_tf_changes
     - when: never
+  artifacts:
+    when: always
+    paths:
+      - tfplan-nonprod_plan_use1.tfplan
+      - status_nonprod_plan_use1.txt
+    expire_in: 1 day
+  after_script:
+    - echo "$CI_JOB_STATUS" > status_nonprod_plan_use1.txt
 
 # -------------------------------------------------------
-# DEV apply jobs
-# Manual by default
+# Optional apply jobs
+# Keep manual
 # -------------------------------------------------------
 dev_apply_usw2:
-  extends: .terraform_apply_template
+  image: hashicorp/terraform:1.12.2
+  stage: apply
   variables:
-    AWS_ROLE_ARN: "$STAGE_ROLE_ARN"
-    ENV_DIR: "environments/dev/primary/us-west-2"
-    TFVARS_FILE: "environments/dev/primary/us-west-2/parameters.primary.tfvars"
+    KUBERNETES_POD_LABELS_INTERNET_ALLOW: "internet=allow"
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://gitlab.corp.zscaler.com
+  before_script:
+    - apk update
+    - apk add --no-cache aws-cli bash
+    - *assume_aws_stage_role
+  script:
+    - cp ./environments/dev/primary/us-west-2/backend.tf ./backend.tf
+    - terraform init
+    - terraform apply -auto-approve -var-file="./environments/dev/primary/us-west-2/parameters.primary.tfvars"
   needs:
     - job: dev_plan_usw2
       artifacts: true
-  dependencies:
-    - dev_plan_usw2
   rules:
     - if: '$CI_PIPELINE_SOURCE == "web" && $[[ inputs.run_mode ]] == "execute"'
       when: manual
     - when: never
+  artifacts:
+    paths:
+      - status_dev_apply_usw2.txt
+  after_script:
+    - echo "$CI_JOB_STATUS" > status_dev_apply_usw2.txt
 
 dev_apply_use1:
-  extends: .terraform_apply_template
+  image: hashicorp/terraform:1.12.2
+  stage: apply
   variables:
-    AWS_ROLE_ARN: "$STAGE_ROLE_ARN"
-    ENV_DIR: "environments/dev/dr/us-east-1"
-    TFVARS_FILE: "environments/dev/dr/us-east-1/parameters.dr.tfvars"
+    KUBERNETES_POD_LABELS_INTERNET_ALLOW: "internet=allow"
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://gitlab.corp.zscaler.com
+  before_script:
+    - apk update
+    - apk add --no-cache aws-cli bash
+    - *assume_aws_stage_role
+  script:
+    - cp ./environments/dev/dr/us-east-1/backend.tf ./backend.tf
+    - terraform init
+    - terraform apply -auto-approve -var-file="./environments/dev/dr/us-east-1/parameters.dr.tfvars"
   needs:
     - job: dev_plan_use1
       artifacts: true
-  dependencies:
-    - dev_plan_use1
   rules:
     - if: '$CI_PIPELINE_SOURCE == "web" && $[[ inputs.run_mode ]] == "execute"'
       when: manual
     - when: never
+  artifacts:
+    paths:
+      - status_dev_apply_use1.txt
+  after_script:
+    - echo "$CI_JOB_STATUS" > status_dev_apply_use1.txt
 
-# -------------------------------------------------------
-# NONPROD apply jobs
-# Manual by default
-# -------------------------------------------------------
 nonprod_apply_usw2:
-  extends: .terraform_apply_template
+  image: hashicorp/terraform:1.12.2
+  stage: apply
   variables:
-    AWS_ROLE_ARN: "$PROD_ROLE_ARN"
-    ENV_DIR: "environments/nonprod/us-west-2"
-    TFVARS_FILE: "environments/nonprod/us-west-2/parameters.usw2-nonprod.tfvars"
+    KUBERNETES_POD_LABELS_INTERNET_ALLOW: "internet=allow"
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://gitlab.corp.zscaler.com
+  before_script:
+    - apk update
+    - apk add --no-cache aws-cli bash
+    - *assume_aws_prod_role
+  script:
+    - cp ./environments/nonprod/us-west-2/backend.tf ./backend.tf
+    - terraform init
+    - terraform apply -auto-approve -var-file="./environments/nonprod/us-west-2/parameters.usw2-nonprod.tfvars"
   needs:
     - job: nonprod_plan_usw2
       artifacts: true
-  dependencies:
-    - nonprod_plan_usw2
   rules:
     - if: '$CI_PIPELINE_SOURCE == "web" && $[[ inputs.run_mode ]] == "execute"'
       when: manual
     - when: never
+  artifacts:
+    paths:
+      - status_nonprod_apply_usw2.txt
+  after_script:
+    - echo "$CI_JOB_STATUS" > status_nonprod_apply_usw2.txt
 
 nonprod_apply_use1:
-  extends: .terraform_apply_template
+  image: hashicorp/terraform:1.12.2
+  stage: apply
   variables:
-    AWS_ROLE_ARN: "$PROD_ROLE_ARN"
-    ENV_DIR: "environments/nonprod/us-east-1"
-    TFVARS_FILE: "environments/nonprod/us-east-1/parameters.dr.tfvars"
+    KUBERNETES_POD_LABELS_INTERNET_ALLOW: "internet=allow"
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://gitlab.corp.zscaler.com
+  before_script:
+    - apk update
+    - apk add --no-cache aws-cli bash
+    - *assume_aws_prod_role
+  script:
+    - cp ./environments/nonprod/us-east-1/backend.tf ./backend.tf
+    - terraform init
+    - terraform apply -auto-approve -var-file="./environments/nonprod/us-east-1/parameters.dr.tfvars"
   needs:
     - job: nonprod_plan_use1
       artifacts: true
-  dependencies:
-    - nonprod_plan_use1
   rules:
     - if: '$CI_PIPELINE_SOURCE == "web" && $[[ inputs.run_mode ]] == "execute"'
       when: manual
     - when: never
+  artifacts:
+    paths:
+      - status_nonprod_apply_use1.txt
+  after_script:
+    - echo "$CI_JOB_STATUS" > status_nonprod_apply_use1.txt
