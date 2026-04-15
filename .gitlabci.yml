@@ -1,0 +1,1476 @@
+# You can override the included template(s) by including variable overrides
+# SAST customization: https://docs.gitlab.com/ee/user/application_security/sast/#customizing-the-sast-settings
+# Secret Detection customization: https://docs.gitlab.com/user/application_security/secret_detection/pipeline/configure
+# Dependency Scanning customization: https://docs.gitlab.com/ee/user/application_security/dependency_scanning/#customizing-the-dependency-scanning-settings
+# Container Scanning customization: https://docs.gitlab.com/ee/user/application_security/container_scanning/#customizing-the-container-scanning-settings
+# Note that environment variables can be set in several places
+# See https://docs.gitlab.com/ee/ci/variables/#cicd-variable-precedence
+
+spec:
+  inputs:
+    target_env:
+      options: ['dev', 'nonprod', 'prod']
+      default: 'dev'
+      description: 'Select target environment'
+
+    primary_region:
+      options: ['us-west-2', 'us-east-1']
+      default: 'us-west-2'
+      description: 'Select primary region'
+
+    run_mode:
+      options: ['validate_only', 'execute']
+      default: 'validate_only'
+      description: 'Select execution mode'
+
+    dr_action:
+      options: ['', 'failover', 'failback']
+      default: ''
+      description: 'Select DR operation'
+
+---
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - when: never
+
+default:
+  retry:
+    max: 2
+    when:
+      - script_failure
+      - runner_system_failure
+      - unknown_failure
+      - scheduler_failure
+
+stages:
+- test
+- secret-detection
+- validate
+- terraform-format-check
+- terraform-scan
+- plan
+- apply
+# - primary-plan
+# - primary-apply
+# - dr-plan
+# - dr-apply
+- failover
+- failback
+- notify
+
+variables:
+  SECRET_DETECTION_ENABLED: 'true'
+  STAGE_ROLE_ARN: arn:aws:iam::792014834907:role/gitlab-vaas-iac-role
+  PROD_ROLE_ARN: arn:aws:iam::100828516796:role/gitlab-vaas-iac-role
+
+secret_detection:
+  stage: secret-detection
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: never
+
+include:
+- template: Security/Secret-Detection.gitlab-ci.yml
+
+# -----------------------------
+# Change sets
+# -----------------------------
+.all_env_changes: &all_env_changes
+  changes:
+    - "*.tf"
+    - "*.tf.json"
+    - modules/**/*
+    - shared/**/*
+
+.dev_env_changes: &dev_env_changes
+  changes:
+    - environments/dev/**/*
+
+.nonprod_env_changes: &nonprod_env_changes
+  changes:
+    - environments/nonprod/**/*
+
+.prod_env_changes: &prod_env_changes
+  changes:
+    - environments/prod/**/*
+
+
+# -----------------------------
+# OIDC -> Assume Role (per-job)
+# -----------------------------
+.assume_aws_role: &assume_aws_role
+  - |
+    if [ -z "$AWS_ROLE_ARN" ]; then
+      echo "ERROR: AWS_ROLE_ARN is not set for this job"
+      exit 1
+    fi
+
+    aws_sts_output=$(aws sts assume-role-with-web-identity \
+      --role-arn "${AWS_ROLE_ARN}" \
+      --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}" \
+      --web-identity-token "${GITLAB_OIDC_TOKEN}" \
+      --duration-seconds 3600 \
+      --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+      --output text)
+
+    export $(printf "AWS_ACCESS_KEY_ID=%s AWS_SECRET_ACCESS_KEY=%s AWS_SESSION_TOKEN=%s" $aws_sts_output)
+    aws sts get-caller-identity
+
+.terraform_base:
+  image: hashicorp/terraform:1.12.2
+  variables:
+    KUBERNETES_POD_LABELS_INTERNET_ALLOW: "internet=allow"
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://gitlab.corp.zscaler.com
+  before_script:
+    - apk update
+    - apk add --no-cache aws-cli bash
+    - *assume_aws_role
+
+# validate if the branch is rebased with main as terraform state might not be updated.
+check-rebased:
+  stage: validate
+  image: alpine/git:latest
+  script:
+    - |
+      # Skip for main branch
+      if [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        echo "On main branch, continuing pipeline"
+        exit 0
+      fi
+      
+      # Fetch main branch
+      git fetch origin main
+      
+      # Check if current branch is rebased on main
+      MERGE_BASE=$(git merge-base HEAD origin/main)
+      MAIN_HEAD=$(git rev-parse origin/main)
+      
+      if [ "$MERGE_BASE" != "$MAIN_HEAD" ]; then
+        echo "ERROR: Branch $CI_COMMIT_BRANCH is not rebased on main!"
+        echo "Please rebase your branch before pushing."
+        exit 1
+      else
+        echo "Branch is properly rebased on main, continuing pipeline"
+      fi
+  allow_failure: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: never
+
+terraform-format-check:
+  stage: terraform-format-check
+  image: hashicorp/terraform:1.12.2
+  script:
+    - echo "Checking Terraform formatting..."
+    - if ! terraform fmt -check; then
+      echo "The following files failed formatting:";
+      terraform fmt -check;
+      exit 1;
+      fi
+  allow_failure: false
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: never
+
+terraform-scan:
+  image: golang:latest
+  stage: terraform-scan
+  variables:
+    KUBERNETES_POD_LABELS_INTERNET_ALLOW: "internet=allow"
+  before_script:
+    - go install github.com/aquasecurity/tfsec/cmd/tfsec@latest
+  script:
+    - tfsec .
+  needs:
+    - check-rebased
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: never
+
+# -----------------------------
+# Terraform plan/apply templates
+# -----------------------------
+.terraform_plan_template:
+  extends: .terraform_base
+  stage: plan
+  script:
+    - test -f "$ENV_DIR/backend.tf"
+    - test -f "$TFVARS_FILE"
+    - cp "$ENV_DIR/backend.tf" ./backend.tf
+    - terraform init
+    - terraform validate
+    - echo "running terraform plan"
+    - terraform plan -out="tfplan-${CI_JOB_NAME}.tfplan" -var-file="$TFVARS_FILE"
+  artifacts:
+    when: always
+    paths:
+      - "tfplan-${CI_JOB_NAME}.tfplan"
+      - "status_${CI_JOB_NAME}.txt"
+    expire_in: 1 day
+  after_script:
+    - echo "$CI_JOB_STATUS" > "status_${CI_JOB_NAME}.txt"
+
+.terraform_apply_template:
+  extends: .terraform_base
+  stage: apply
+  script:
+    - test -f "$ENV_DIR/backend.tf"
+    - test -f "$TFVARS_FILE"
+    - cp "$ENV_DIR/backend.tf" ./backend.tf
+    - terraform init
+    - echo "running terraform apply"
+    - terraform apply -auto-approve -var-file="$TFVARS_FILE"
+  artifacts:
+    when: always
+    paths:
+      - "status_${CI_JOB_NAME}.txt"
+    expire_in: 1 day
+  after_script:
+    - echo "$CI_JOB_STATUS" > "status_${CI_JOB_NAME}.txt"
+
+# -----------------------------
+# DEV (uses STAGE_ROLE_ARN)
+# -----------------------------
+# =========================================================
+# DEV - PLAN (split per region)
+# =========================================================
+
+dev_plan_usw2:
+  extends: .terraform_plan_template
+  variables:
+    AWS_ROLE_ARN: "$STAGE_ROLE_ARN"
+    ENV_DIR: "environments/dev/primary/us-west-2"
+    TFVARS_FILE: "environments/dev/primary/us-west-2/parameters.primary.tfvars"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - environments/dev/primary/us-west-2/**/*
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      <<: *all_env_changes
+    - when: never
+
+dev_plan_use1:
+  extends: .terraform_plan_template
+  variables:
+    AWS_ROLE_ARN: "$STAGE_ROLE_ARN"
+    ENV_DIR: "environments/dev/dr/us-east-1"
+    TFVARS_FILE: "environments/dev/dr/us-east-1/parameters.dr.tfvars"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - environments/dev/dr/us-east-1/**/*
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      <<: *all_env_changes
+    - when: never
+
+
+
+# -----------------------------
+# NONPROD (uses PROD_ROLE_ARN as per your requirement)
+# -----------------------------
+nonprod_plan_usw2:
+  extends: .terraform_plan_template
+  variables:
+    AWS_ROLE_ARN: "$PROD_ROLE_ARN"
+    ENV_DIR: "environments/nonprod/us-west-2"
+    TFVARS_FILE: "environments/nonprod/us-west-2/parameters.usw2-nonprod.tfvars"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - environments/nonprod/us-west-2/**/*
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      <<: *all_env_changes
+    - when: never
+
+nonprod_plan_use1:
+  extends: .terraform_plan_template
+  variables:
+    AWS_ROLE_ARN: "$PROD_ROLE_ARN"
+    ENV_DIR: "environments/nonprod/us-east-1"
+    TFVARS_FILE: "environments/nonprod/us-east-1/parameters.dr.tfvars"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - environments/nonprod/us-east-1/**/*
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      <<: *all_env_changes
+    - when: never
+
+# nonprod_apply:
+#   extends: .tf_apply
+#   variables:
+#     AWS_ROLE_ARN: "$PROD_ROLE_ARN"
+#   needs: ["nonprod_plan"]
+#   parallel:
+#     matrix:
+#       - ENV_DIR: "environments/nonprod/us-west-2"
+#         TFVARS_FILE: "environments/nonprod/us-west-2/parameters.usw2-nonprod.tfvars"
+#       - ENV_DIR: "environments/nonprod/us-east-1"
+#         TFVARS_FILE: "environments/nonprod/us-east-1/parameters.dr.tfvars"
+#   rules:
+#     - if: '($CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH || $CI_PIPELINE_SOURCE == "web") && ${{ inputs.run_mode }} == "execute"'
+#       when: manual
+#     - when: never
+
+# -----------------------------
+# PROD (uses PROD_ROLE_ARN)
+# NOTE: Update ENV_DIR/TFVARS_FILE paths to match your prod folder naming.
+# -----------------------------
+# prod_plan:
+#   extends: .tf_plan
+#   variables:
+#     AWS_ROLE_ARN: "$PROD_ROLE_ARN"
+#   parallel:
+#     matrix:
+#       - ENV_DIR: "environments/prod/primary/us-west-2"
+#         TFVARS_FILE: "environments/prod/primary/us-west-2/parameters.primary.tfvars"
+#       - ENV_DIR: "environments/prod/dr/us-east-1"
+#         TFVARS_FILE: "environments/prod/dr/us-east-1/parameters.dr.tfvars"
+#   rules:
+#     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+#       <<: *prod_env_changes
+#     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+#       <<: *all_env_changes
+#     - when: never
+
+# prod_apply:
+#   extends: .tf_apply
+#   variables:
+#     AWS_ROLE_ARN: "$PROD_ROLE_ARN"
+#   needs: ["prod_plan"]
+#   parallel:
+#     matrix:
+#       - ENV_DIR: "environments/prod/primary/us-west-2"
+#         TFVARS_FILE: "environments/prod/primary/us-west-2/parameters.primary.tfvars"
+#       - ENV_DIR: "environments/prod/dr/us-east-1"
+#         TFVARS_FILE: "environments/prod/dr/us-east-1/parameters.dr.tfvars"
+#   rules:
+#     - if: '($CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH || $CI_PIPELINE_SOURCE == "web") && ${{ inputs.run_mode }} == "execute"'
+#       when: manual
+#     - when: never
+
+# primary-plan:
+#   extends: .terraform_base
+#   stage: primary-plan
+#   script:
+#     - cp ./environments/dev/primary/us-west-2/backend.tf ./backend.tf
+#     - terraform init
+#     - terraform validate
+#     - echo "Planning DEV PRIMARY bootstrap with VPC peering disabled"
+#     - terraform plan -out=dev-primary.tfplan -var-file="./environments/dev/primary/us-west-2/parameters.primary.tfvars"
+#   needs:
+#     - terraform-scan
+#   rules:
+#     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+#     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+#     - if: '$CI_PIPELINE_SOURCE == "web"'
+#       when: never
+#   artifacts:
+#     paths:
+#       - dev-primary.tfplan
+
+# primary-apply:
+#   extends: .terraform_base
+#   stage: primary-apply
+#   script:
+#     - cp ./environments/dev/primary/us-west-2/backend.tf ./backend.tf
+#     - terraform init
+#     - echo "Applying DEV PRIMARY bootstrap plan"
+#     - terraform apply -auto-approve -var-file="./environments/dev/primary/us-west-2/parameters.primary.tfvars"
+#   needs:
+#     - job: primary-plan
+#       artifacts: true
+#   dependencies:
+#     - primary-plan
+#   rules:
+#     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+#     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+#     - if: '$CI_PIPELINE_SOURCE == "web"'
+#       when: never
+#   artifacts:
+#     paths:
+#       - status_dev_primary_bootstrap_apply.txt
+#   after_script:
+#     - echo "$CI_JOB_STATUS" > status_dev_primary_bootstrap_apply.txt
+
+# dr-plan:
+#   extends: .terraform_base
+#   stage: dr-plan
+#   script:
+#     - cp ./environments/dev/dr/us-east-1/backend.tf ./backend.tf
+#     - terraform init
+#     - terraform validate
+#     - echo "Planning DEV DR deployment"
+#     - terraform plan -out=dev-dr.tfplan -var-file="./environments/dev/dr/us-east-1/parameters.dr.tfvars"
+#   needs:
+#     - primary-plan
+#   rules:
+#     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+#     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+#     - if: '$CI_PIPELINE_SOURCE == "web"'
+#       when: never
+#   artifacts:
+#     paths:
+#       - dev-dr.tfplan
+
+# dr-apply:
+#   extends: .terraform_base
+#   stage: dr-apply
+#   script:
+#     - cp ./environments/dev/dr/us-east-1/backend.tf ./backend.tf
+#     - terraform init
+#     - echo "Applying DEV DR plan"
+#     - terraform apply -auto-approve -var-file="./environments/dev/dr/us-east-1/parameters.dr.tfvars"
+#   needs:
+#     - job: dr-plan
+#       artifacts: true
+#   dependencies:
+#     - dr-plan
+#   rules:
+#     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+#     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+#     - if: '$CI_PIPELINE_SOURCE == "web"'
+#       when: never
+#   artifacts:
+#     paths:
+#       - status_dev_dr_apply.txt
+#   after_script:
+#     - echo "$CI_JOB_STATUS" > status_dev_dr_apply.txt
+
+# primary-peering-plan:
+#   extends: .terraform_base
+#   stage: primary-peering-plan
+#   script:
+#     - cp ./environments/dev/primary/us-west-2/backend.tf ./backend.tf
+#     - terraform init
+#     - terraform validate
+#     - echo "Planning DEV PRIMARY steady-state apply with peering enabled from tfvars"
+#     - terraform plan -out=dev-primary-peering.tfplan -var-file="./environments/dev/primary/us-west-2/parameters.primary.tfvars" -var="enable_peering=true"
+#   needs:
+#     - dr-apply
+#   rules:
+#     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+#     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+#     - if: '$CI_PIPELINE_SOURCE == "web"'
+#       when: never
+#   artifacts:
+#     paths:
+#       - dev-primary-peering.tfplan
+
+# primary-peering-apply:
+#   extends: .terraform_base
+#   stage: primary-peering-apply
+#   script:
+#     - cp ./environments/dev/primary/us-west-2/backend.tf ./backend.tf
+#     - terraform init
+#     - echo "Applying DEV PRIMARY peering plan"
+#     - terraform apply -auto-approve -var-file="./environments/dev/primary/us-west-2/parameters.primary.tfvars" -var="enable_peering=true"
+#   needs:
+#     - job: primary-peering-plan
+#       artifacts: true
+#   dependencies:
+#     - primary-peering-plan
+#   rules:
+#     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+#     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+#     - if: '$CI_PIPELINE_SOURCE == "web"'
+#       when: never
+#   artifacts:
+#     paths:
+#       - status_dev_primary_peering_apply.txt
+#   after_script:
+#     - echo "$CI_JOB_STATUS" > status_dev_primary_peering_apply.txt
+
+# vault-init:
+#   stage: vault-init
+#   image: amazon/aws-cli:2.15.57
+#   when: manual
+#   allow_failure: true
+
+#   parallel:
+#     matrix:
+#       - TARGET: "PRIMARY"
+#         AWS_REGION: "us-west-2"
+#         VAULT_TAG_NAME: "vaas-dev-primary"
+#         BASTION_INSTANCE_ID: "i-0957342a4e454e69e"
+#         SSH_KEY_PATH_ON_BASTION: "/usr/bin/vaas-dev-primary/vault-usw2-dev-ssh-key.pem"
+#         SSH_USER: "ubuntu"
+#         VAULT_ADDR_LOCAL: "https://usw2.dev.vault.corp.zscaler.com:8200"
+#         VAULT_CACERT_PATH: "/etc/vault.d/tls/ca.pem"
+#         ROOT_TOKEN_SECRET_NAME: "vaas/dev/primary/root-token"
+#         ENABLE_REPLICATION: "false"
+#         REPLICA_REGION: ""
+
+#       - TARGET: "DR"
+#         AWS_REGION: "us-east-1"
+#         VAULT_TAG_NAME: "vaas-dev-dr"
+#         BASTION_INSTANCE_ID: "i-076259481ae826b71"
+#         SSH_KEY_PATH_ON_BASTION: "/usr/bin/vaas-dev-dr/vault-dev-dr-ssh-key.pem"
+#         SSH_USER: "ubuntu"
+#         VAULT_ADDR_LOCAL: "https://use1.dev.vault.corp.zscaler.com:8200"
+#         VAULT_CACERT_PATH: "/etc/vault.d/tls/ca.pem"
+#         ROOT_TOKEN_SECRET_NAME: "vaas/dev/dr/root-token"
+#         ENABLE_REPLICATION: "true"
+#         REPLICA_REGION: "us-west-2"
+
+#   variables:
+#     STAGE_ROLE_ARN: "arn:aws:iam::792014834907:role/gitlab-vaas-iac-role"
+#     KUBERNETES_POD_LABELS_INTERNET_ALLOW: "internet=allow"
+
+#   id_tokens:
+#     GITLAB_OIDC_TOKEN:
+#       aud: https://gitlab.corp.zscaler.com
+
+#   before_script:
+#     - set -euo pipefail
+#     - yum -y install bash coreutils jq >/dev/null 2>&1 || true
+#     - aws --version
+
+#   script:
+#     - |
+#       echo "=== [$TARGET] Assuming role via OIDC ==="
+
+#       aws_sts_output="$(aws sts assume-role-with-web-identity \
+#         --role-arn "${STAGE_ROLE_ARN}" \
+#         --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}-${TARGET}" \
+#         --web-identity-token "${GITLAB_OIDC_TOKEN}" \
+#         --duration-seconds 3600 \
+#         --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+#         --output text)"
+
+#       export AWS_ACCESS_KEY_ID="$(echo "$aws_sts_output" | awk '{print $1}')"
+#       export AWS_SECRET_ACCESS_KEY="$(echo "$aws_sts_output" | awk '{print $2}')"
+#       export AWS_SESSION_TOKEN="$(echo "$aws_sts_output" | awk '{print $3}')"
+
+#       aws sts get-caller-identity
+
+#     - |
+#       echo "=== [$TARGET] Discovering Vault nodes ==="
+
+#       VAULT_NODE_IPS="$(
+#         aws ec2 describe-instances \
+#           --region "${AWS_REGION}" \
+#           --filters \
+#             "Name=tag:Name,Values=${VAULT_TAG_NAME}" \
+#             "Name=instance-state-name,Values=running" \
+#           --query 'Reservations[].Instances[].PrivateIpAddress' \
+#           --output text | tr '\t' '\n'
+#       )"
+
+#       if [ -z "${VAULT_NODE_IPS}" ]; then
+#         echo "No running Vault instances found for tag ${VAULT_TAG_NAME} in ${AWS_REGION}"
+#         exit 1
+#       fi
+
+#       echo "${VAULT_NODE_IPS}"
+
+#       TARGET_VAULT_IP="$(echo "$VAULT_NODE_IPS" | head -n1)"
+
+#       if [ -z "${TARGET_VAULT_IP}" ]; then
+#         echo "Unable to determine target Vault IP"
+#         exit 1
+#       fi
+
+#       echo "Selected node: ${TARGET_VAULT_IP}"
+
+#     - |
+#       echo "=== [$TARGET] Sending SSM command ==="
+
+#       CMD_ID=$(aws ssm send-command \
+#         --region "$AWS_REGION" \
+#         --instance-ids "$BASTION_INSTANCE_ID" \
+#         --document-name "AWS-RunShellScript" \
+#         --parameters commands="[
+#           \"set -euo pipefail\",
+#           \"echo Running on bastion: \$(hostname)\",
+#           \"echo Target Vault node: $TARGET_VAULT_IP\",
+#           \"mkdir -p /root/.ssh\",
+#           \"ssh-keygen -R $TARGET_VAULT_IP >/dev/null 2>&1 || true\",
+#           \"ssh-keyscan -H $TARGET_VAULT_IP >> /root/.ssh/known_hosts 2>/dev/null || true\",
+#           \"STATUS=0\",
+#           \"STATUS_OUT=\$(ssh -i $SSH_KEY_PATH_ON_BASTION -o StrictHostKeyChecking=no $SSH_USER@$TARGET_VAULT_IP 'sudo -i bash -lc \\\"export VAULT_ADDR=$VAULT_ADDR_LOCAL; export VAULT_CACERT=$VAULT_CACERT_PATH; vault operator init -status\\\"' 2>&1) || STATUS=\$?\",
+#           \"echo \\\"\$STATUS_OUT\\\"\",
+#           \"if [ \\\"\$STATUS\\\" -eq 0 ]; then echo Vault already initialized; exit 0; fi\",
+#           \"if [ \\\"\$STATUS\\\" -ne 2 ]; then echo Unexpected vault status exit code \$STATUS; exit 1; fi\",
+#           \"echo Running vault initialization\",
+#           \"INIT_JSON=\$(ssh -i $SSH_KEY_PATH_ON_BASTION -o StrictHostKeyChecking=no $SSH_USER@$TARGET_VAULT_IP 'sudo -i bash -lc \\\"export VAULT_ADDR=$VAULT_ADDR_LOCAL; export VAULT_CACERT=$VAULT_CACERT_PATH; vault operator init -format=json\\\"')\",
+#           \"ROOT_TOKEN=\$(echo \\\"\$INIT_JSON\\\" | jq -r '.root_token')\",
+#           \"if [ -z \\\"\$ROOT_TOKEN\\\" ] || [ \\\"\$ROOT_TOKEN\\\" = \\\"null\\\" ]; then echo Failed to extract root token; exit 1; fi\",
+#           \"SECRET_PAYLOAD=\\\"{\\\\\\\"root_token\\\\\\\":\\\\\\\"\$ROOT_TOKEN\\\\\\\"}\\\"\",
+#           \"echo Writing primary secret in region $AWS_REGION\",
+#           \"if aws secretsmanager describe-secret --region $AWS_REGION --secret-id $ROOT_TOKEN_SECRET_NAME >/dev/null 2>&1; then\",
+#           \"  echo Secret exists. Updating value\",
+#           \"  aws secretsmanager put-secret-value --region $AWS_REGION --secret-id $ROOT_TOKEN_SECRET_NAME --secret-string \\\"\$SECRET_PAYLOAD\\\"\",
+#           \"else\",
+#           \"  echo Secret does not exist. Creating secret\",
+#           \"  aws secretsmanager create-secret --region $AWS_REGION --name $ROOT_TOKEN_SECRET_NAME --secret-string \\\"\$SECRET_PAYLOAD\\\"\",
+#           \"fi\",
+#           \"if [ \\\"$ENABLE_REPLICATION\\\" = \\\"true\\\" ] && [ -n \\\"$REPLICA_REGION\\\" ]; then\",
+#           \"  echo Ensuring replication to region $REPLICA_REGION\",
+#           \"  REPL_STATUS=\$(aws secretsmanager describe-secret --region $AWS_REGION --secret-id $ROOT_TOKEN_SECRET_NAME --query 'ReplicationStatus[?Region==\\\`$REPLICA_REGION\\\`].Status' --output text 2>/dev/null || true)\",
+#           \"  if [ -z \\\"\$REPL_STATUS\\\" ] || [ \\\"\$REPL_STATUS\\\" = \\\"None\\\" ]; then\",
+#           \"    echo Replication not present. Enabling replication to $REPLICA_REGION\",
+#           \"    aws secretsmanager replicate-secret-to-regions --region $AWS_REGION --secret-id $ROOT_TOKEN_SECRET_NAME --add-replica-regions Region=$REPLICA_REGION\",
+#           \"  else\",
+#           \"    echo Replication already configured for $REPLICA_REGION with status: \$REPL_STATUS\",
+#           \"  fi\",
+#           \"fi\",
+#           \"echo Vault initialization complete\"
+#         ]" \
+#         --query "Command.CommandId" \
+#         --output text)
+
+#       echo "SSM Command ID: $CMD_ID"
+
+#     - |
+#       echo "=== Waiting for SSM execution ==="
+
+#       STATUS=""
+
+#       for i in $(seq 1 60); do
+#         STATUS=$(aws ssm get-command-invocation \
+#           --region "$AWS_REGION" \
+#           --command-id "$CMD_ID" \
+#           --instance-id "$BASTION_INSTANCE_ID" \
+#           --query Status \
+#           --output text 2>/dev/null || true)
+
+#         echo "Poll $i: Status=$STATUS"
+
+#         if [[ "$STATUS" == "Success" || "$STATUS" == "Failed" || "$STATUS" == "Cancelled" || "$STATUS" == "TimedOut" ]]; then
+#           break
+#         fi
+
+#         sleep 10
+#       done
+
+#       echo "=== [$TARGET] StandardOutput ==="
+#       aws ssm get-command-invocation \
+#         --region "$AWS_REGION" \
+#         --command-id "$CMD_ID" \
+#         --instance-id "$BASTION_INSTANCE_ID" \
+#         --query StandardOutputContent \
+#         --output text || true
+
+#       echo "=== [$TARGET] StandardError ==="
+#       aws ssm get-command-invocation \
+#         --region "$AWS_REGION" \
+#         --command-id "$CMD_ID" \
+#         --instance-id "$BASTION_INSTANCE_ID" \
+#         --query StandardErrorContent \
+#         --output text || true
+
+#       if [ "$STATUS" != "Success" ]; then
+#         echo "SSM execution failed"
+#         exit 1
+#       fi
+
+#   needs:
+#     - primary-peering-apply
+
+#   rules:
+#     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+#     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+#     - if: '$CI_PIPELINE_SOURCE == "web"'
+#       when: never
+    
+
+# dr-replication:
+#   stage: dr-replication
+#   image: amazon/aws-cli:2.15.57
+
+#   variables:
+#     STAGE_ROLE_ARN: "arn:aws:iam::792014834907:role/gitlab-vaas-iac-role"
+#     AWS_REGION: "us-west-2"
+#     BASTION_INSTANCE_ID: "i-0957342a4e454e69e"
+
+#     VAULT_PRIMARY_ADDR: "https://usw2.dev.vault.corp.zscaler.com:8200"
+#     VAULT_SECONDARY_ADDR: "https://use1.dev.vault.corp.zscaler.com:8200"
+
+#     VAULT_PRIMARY_TOKEN_SECRET_ID: "vaas/dev/primary/root-token"
+#     VAULT_SECONDARY_TOKEN_SECRET_ID: "vaas/dev/dr/root-token"
+#     VAULT_TOKEN_JSON_KEY: "root_token"
+
+#     VAULT_PRIMARY_CLUSTER_ID: "usw2"
+#     POST_ENABLE_SLEEP_SECONDS: "8"
+
+#     KUBERNETES_POD_LABELS_INTERNET_ALLOW: "internet=allow"
+
+#   id_tokens:
+#     GITLAB_OIDC_TOKEN:
+#       aud: https://gitlab.corp.zscaler.com
+
+#   before_script:
+#     - set -euo pipefail
+#     - yum -y install bash coreutils jq >/dev/null 2>&1 || true
+#     - aws --version
+
+#   script:
+#     - |
+#       echo "=== Assuming role via OIDC ==="
+
+#       aws_sts_output="$(aws sts assume-role-with-web-identity \
+#         --role-arn "${STAGE_ROLE_ARN}" \
+#         --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}-dr-replication" \
+#         --web-identity-token "${GITLAB_OIDC_TOKEN}" \
+#         --duration-seconds 3600 \
+#         --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+#         --output text)"
+
+#       export AWS_ACCESS_KEY_ID="$(echo "$aws_sts_output" | awk '{print $1}')"
+#       export AWS_SECRET_ACCESS_KEY="$(echo "$aws_sts_output" | awk '{print $2}')"
+#       export AWS_SESSION_TOKEN="$(echo "$aws_sts_output" | awk '{print $3}')"
+
+#       aws sts get-caller-identity
+
+#     - |
+#       echo "=== Encoding replication script ==="
+#       SCRIPT_B64="$(base64 -w 0 scripts/enable_dr_replication.py)"
+#       export SCRIPT_B64
+
+#     - |
+#       echo "=== Sending SSM command to bastion ==="
+
+#       CMD_ID=$(aws ssm send-command \
+#         --region "$AWS_REGION" \
+#         --instance-ids "$BASTION_INSTANCE_ID" \
+#         --document-name "AWS-RunShellScript" \
+#         --parameters commands="[
+#           \"set -euo pipefail\",
+#           \"echo Running on bastion: \$(hostname)\",
+#           \"mkdir -p /tmp/vault-dr-replication\",
+#           \"cd /tmp/vault-dr-replication\",
+#           \"cat <<'EOF' | base64 -d > dr_replication_no_ca.py\",
+#           \"$SCRIPT_B64\",
+#           \"EOF\",
+#           \"chmod 700 dr_replication_no_ca.py\",
+#           \"export AWS_REGION='$AWS_REGION'\",
+#           \"export VAULT_PRIMARY_ADDR='$VAULT_PRIMARY_ADDR'\",
+#           \"export VAULT_SECONDARY_ADDR='$VAULT_SECONDARY_ADDR'\",
+#           \"export VAULT_PRIMARY_TOKEN_SECRET_ID='$VAULT_PRIMARY_TOKEN_SECRET_ID'\",
+#           \"export VAULT_SECONDARY_TOKEN_SECRET_ID='$VAULT_SECONDARY_TOKEN_SECRET_ID'\",
+#           \"export VAULT_TOKEN_JSON_KEY='$VAULT_TOKEN_JSON_KEY'\",
+#           \"export VAULT_PRIMARY_CLUSTER_ID='$VAULT_PRIMARY_CLUSTER_ID'\",
+#           \"export POST_ENABLE_SLEEP_SECONDS='$POST_ENABLE_SLEEP_SECONDS'\",
+#           \"python3 dr_replication_no_ca.py\"
+#         ]" \
+#         --query "Command.CommandId" \
+#         --output text)
+
+#       echo "SSM Command ID: $CMD_ID"
+#       export CMD_ID
+
+#     - |
+#       echo "=== Waiting for SSM execution ==="
+
+#       STATUS=""
+
+#       for i in $(seq 1 60); do
+#         STATUS=$(aws ssm get-command-invocation \
+#           --region "$AWS_REGION" \
+#           --command-id "$CMD_ID" \
+#           --instance-id "$BASTION_INSTANCE_ID" \
+#           --query Status \
+#           --output text 2>/dev/null || true)
+
+#         echo "Poll $i: Status=$STATUS"
+
+#         if [[ "$STATUS" == "Success" || "$STATUS" == "Failed" || "$STATUS" == "TimedOut" || "$STATUS" == "Cancelled" ]]; then
+#           break
+#         fi
+
+#         sleep 10
+#       done
+
+#       echo "=== SSM STDOUT ==="
+#       aws ssm get-command-invocation \
+#         --region "$AWS_REGION" \
+#         --command-id "$CMD_ID" \
+#         --instance-id "$BASTION_INSTANCE_ID" \
+#         --query StandardOutputContent \
+#         --output text || true
+
+#       echo "=== SSM STDERR ==="
+#       aws ssm get-command-invocation \
+#         --region "$AWS_REGION" \
+#         --command-id "$CMD_ID" \
+#         --instance-id "$BASTION_INSTANCE_ID" \
+#         --query StandardErrorContent \
+#         --output text || true
+
+#       if [ "$STATUS" != "Success" ]; then
+#         echo "SSM execution failed"
+#         exit 1
+#       fi
+#   needs:
+#     - vault-init
+#   rules:
+#     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+#     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+#     - if: '$CI_PIPELINE_SOURCE == "web"'
+#       when: never
+
+# vault-restart-dr:
+#   stage: vault-restart-dr
+#   image: amazon/aws-cli:2.15.57
+
+#   variables:
+#     AWS_REGION: "us-east-1"
+#     VAULT_TAG_NAME: "vaas-dev-dr"
+#     BASTION_INSTANCE_ID: "i-076259481ae826b71"
+#     SSH_KEY_PATH_ON_BASTION: "/usr/bin/vaas-dev-dr/vault-dev-dr-ssh-key.pem"
+#     SSH_USER: "ubuntu"
+#     STAGE_ROLE_ARN: "arn:aws:iam::792014834907:role/gitlab-vaas-iac-role"
+#     KUBERNETES_POD_LABELS_INTERNET_ALLOW: "internet=allow"
+
+#   id_tokens:
+#     GITLAB_OIDC_TOKEN:
+#       aud: https://gitlab.corp.zscaler.com
+
+#   before_script:
+#     - set -euo pipefail
+#     - yum -y install bash coreutils jq >/dev/null 2>&1 || true
+#     - aws --version
+
+#   script:
+#     - |
+#       echo "=== [DR-RESTART] Assuming role via OIDC ==="
+
+#       aws_sts_output="$(aws sts assume-role-with-web-identity \
+#         --role-arn "${STAGE_ROLE_ARN}" \
+#         --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}-DR-RESTART" \
+#         --web-identity-token "${GITLAB_OIDC_TOKEN}" \
+#         --duration-seconds 3600 \
+#         --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+#         --output text)"
+
+#       export AWS_ACCESS_KEY_ID="$(echo "$aws_sts_output" | awk '{print $1}')"
+#       export AWS_SECRET_ACCESS_KEY="$(echo "$aws_sts_output" | awk '{print $2}')"
+#       export AWS_SESSION_TOKEN="$(echo "$aws_sts_output" | awk '{print $3}')"
+
+#       aws sts get-caller-identity
+
+#     - |
+#       echo "=== [DR-RESTART] Discovering all running Vault nodes in us-east-1 ==="
+
+#       VAULT_NODE_IPS="$(
+#         aws ec2 describe-instances \
+#           --region "${AWS_REGION}" \
+#           --filters \
+#             "Name=tag:Name,Values=${VAULT_TAG_NAME}" \
+#             "Name=instance-state-name,Values=running" \
+#           --query 'Reservations[].Instances[].PrivateIpAddress' \
+#           --output text | tr '\t' '\n' | sed '/^$/d'
+#       )"
+
+#       if [ -z "${VAULT_NODE_IPS}" ]; then
+#         echo "No running Vault instances found for tag ${VAULT_TAG_NAME} in ${AWS_REGION}"
+#         exit 1
+#       fi
+
+#       echo "Vault nodes found:"
+#       echo "${VAULT_NODE_IPS}"
+
+#       VAULT_NODE_IPS_CSV="$(echo "${VAULT_NODE_IPS}" | paste -sd, -)"
+#       echo "CSV list: ${VAULT_NODE_IPS_CSV}"
+
+#     - |
+#       echo "=== [DR-RESTART] Sending SSM command to us-east-1 bastion ==="
+
+#       CMD_ID=$(aws ssm send-command \
+#         --region "$AWS_REGION" \
+#         --instance-ids "$BASTION_INSTANCE_ID" \
+#         --document-name "AWS-RunShellScript" \
+#         --parameters commands="[
+#           \"set -euo pipefail\",
+#           \"echo Running on bastion: \$(hostname)\",
+#           \"mkdir -p /root/.ssh\",
+#           \"IPS=\\\"$VAULT_NODE_IPS_CSV\\\"\",
+#           \"IFS=, read -r -a NODE_ARRAY <<< \\\"\$IPS\\\"\",
+#           \"for NODE_IP in \\\"\${NODE_ARRAY[@]}\\\"; do\",
+#           \"  echo ===== Restarting Vault on \$NODE_IP =====\",
+#           \"  ssh-keygen -R \$NODE_IP >/dev/null 2>&1 || true\",
+#           \"  ssh-keyscan -H \$NODE_IP >> /root/.ssh/known_hosts 2>/dev/null || true\",
+#           \"  ssh -i $SSH_KEY_PATH_ON_BASTION -o StrictHostKeyChecking=no $SSH_USER@\$NODE_IP 'sudo systemctl restart vault'\",
+#           \"  echo Waiting 5 seconds after restart on \$NODE_IP\",
+#           \"  sleep 5\",
+#           \"  ssh -i $SSH_KEY_PATH_ON_BASTION -o StrictHostKeyChecking=no $SSH_USER@\$NODE_IP 'sudo systemctl status vault --no-pager -l | head -n 20'\",
+#           \"done\",
+#           \"echo Vault restart completed on all us-east-1 nodes\"
+#         ]" \
+#         --query "Command.CommandId" \
+#         --output text)
+
+#       echo "SSM Command ID: $CMD_ID"
+
+#     - |
+#       echo "=== [DR-RESTART] Waiting for SSM execution ==="
+
+#       STATUS=""
+
+#       for i in $(seq 1 60); do
+#         STATUS=$(aws ssm get-command-invocation \
+#           --region "$AWS_REGION" \
+#           --command-id "$CMD_ID" \
+#           --instance-id "$BASTION_INSTANCE_ID" \
+#           --query Status \
+#           --output text 2>/dev/null || true)
+
+#         echo "Poll $i: Status=$STATUS"
+
+#         if [[ "$STATUS" == "Success" || "$STATUS" == "Failed" || "$STATUS" == "Cancelled" || "$STATUS" == "TimedOut" ]]; then
+#           break
+#         fi
+
+#         sleep 10
+#       done
+
+#       echo "=== [DR-RESTART] StandardOutput ==="
+#       aws ssm get-command-invocation \
+#         --region "$AWS_REGION" \
+#         --command-id "$CMD_ID" \
+#         --instance-id "$BASTION_INSTANCE_ID" \
+#         --query StandardOutputContent \
+#         --output text || true
+
+#       echo "=== [DR-RESTART] StandardError ==="
+#       aws ssm get-command-invocation \
+#         --region "$AWS_REGION" \
+#         --command-id "$CMD_ID" \
+#         --instance-id "$BASTION_INSTANCE_ID" \
+#         --query StandardErrorContent \
+#         --output text || true
+
+#       if [ "$STATUS" != "Success" ]; then
+#         echo "SSM execution failed with status: $STATUS"
+#         exit 1
+#       fi
+
+#   needs:
+#     - dr-replication
+
+#   rules:
+#     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+#     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+#     - if: '$CI_PIPELINE_SOURCE == "web"'
+#       when: never
+
+
+failover:
+  stage: failover
+  image: amazon/aws-cli:2.15.57
+  when: manual
+  resource_group: "vault-dr-$[[ inputs.target_env ]]-$[[ inputs.primary_region ]]"
+
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://gitlab.corp.zscaler.com
+
+  variables:
+    VAULT_TOKEN_JSON_KEY: "root_token"
+    FAILOVER_TOKEN_JSON_KEY: "token"
+    POST_PROMOTE_SLEEP_SECONDS: "8"
+    MIN_STEP_SLEEP_SECONDS: "2"
+    MAX_STEP_SLEEP_SECONDS: "5"
+    POST_UPDATE_SLEEP_SECONDS: "6"
+
+  before_script:
+    - set -euo pipefail
+    - yum -y install bash coreutils jq python3 >/dev/null 2>&1 || true
+    - aws --version
+
+    - export TARGET_ENV="$[[ inputs.target_env ]]"
+    - export PRIMARY_REGION="$[[ inputs.primary_region ]]"
+    - export RUN_MODE="$[[ inputs.run_mode ]]"
+    - export DR_ACTION="$[[ inputs.dr_action ]]"
+
+    - |
+      echo "=== Selected Inputs ==="
+      echo "TARGET_ENV=$TARGET_ENV"
+      echo "PRIMARY_REGION=$PRIMARY_REGION"
+      echo "RUN_MODE=$RUN_MODE"
+      echo "DR_ACTION=$DR_ACTION"
+
+    - |
+      if [ -z "$DR_ACTION"]; then
+        echo "ERROR: DR_ACTION must be selected"
+        exit 1
+      fi
+
+    - |
+      case "$TARGET_ENV" in
+        dev|nonprod|prod) ;;
+        *)
+          echo "ERROR: Unsupported TARGET_ENV=$TARGET_ENV"
+          exit 1
+          ;;
+      esac
+
+      case "$PRIMARY_REGION" in
+        us-west-2|us-east-1) ;;
+        *)
+          echo "ERROR: Unsupported PRIMARY_REGION=$PRIMARY_REGION"
+          exit 1
+          ;;
+      esac
+
+      case "$RUN_MODE" in
+        validate_only|execute) ;;
+        *)
+          echo "ERROR: Unsupported RUN_MODE=$RUN_MODE"
+          exit 1
+          ;;
+      esac
+
+      case "$DR_ACTION" in
+        failover|failback) ;;
+        *)
+          echo "ERROR: Unsupported DR_ACTION=$DR_ACTION"
+          exit 1
+          ;;
+      esac
+
+    - |
+      echo "=== Resolve Region Mapping ==="
+      case "$PRIMARY_REGION" in
+        us-west-2)
+          export AWS_REGION="us-west-2"
+          export PRIMARY_REGION_SHORT="usw2"
+          export SECONDARY_REGION="us-east-1"
+          export SECONDARY_REGION_SHORT="use1"
+          export VAULT_SECONDARY_CLUSTER_ID="use1"
+          ;;
+        us-east-1)
+          export AWS_REGION="us-east-1"
+          export PRIMARY_REGION_SHORT="use1"
+          export SECONDARY_REGION="us-west-2"
+          export SECONDARY_REGION_SHORT="usw2"
+          export VAULT_SECONDARY_CLUSTER_ID="usw2"
+          ;;
+      esac
+
+    - |
+      echo "=== Derive Vault URLs and Secret IDs ==="
+      export VAULT_PRIMARY_ADDR="https://${PRIMARY_REGION_SHORT}.${TARGET_ENV}.vault.corp.zscaler.com:8200"
+      export VAULT_SECONDARY_ADDR="https://${SECONDARY_REGION_SHORT}.${TARGET_ENV}.vault.corp.zscaler.com:8200"
+
+      export VAULT_PRIMARY_TOKEN_SECRET_ID="vaas/${TARGET_ENV}/primary/root-token"
+      export FAILOVER_TOKEN_SECRET_ID="vaas/${TARGET_ENV}/dr/failover-batch-token"
+
+    - |
+      echo "=== Resolve Bastion and Role Mapping ==="
+      case "${TARGET_ENV}:${PRIMARY_REGION}" in
+        "dev:us-west-2")
+          export STAGE_ROLE_ARN="arn:aws:iam::792014834907:role/gitlab-vaas-iac-role"
+          export BASTION_INSTANCE_ID="i-0957342a4e454e69e"
+          ;;
+
+        "dev:us-east-1")
+          export STAGE_ROLE_ARN="arn:aws:iam::792014834907:role/gitlab-vaas-iac-role"
+          export BASTION_INSTANCE_ID="i-REPLACE-DEV-USE1-BASTION"
+          ;;
+
+        "nonprod:us-west-2")
+          export STAGE_ROLE_ARN="arn:aws:iam::REPLACE_NONPROD_ACCOUNT_ID:role/gitlab-vaas-iac-role"
+          export BASTION_INSTANCE_ID="i-REPLACE-NONPROD-USW2-BASTION"
+          ;;
+
+        "nonprod:us-east-1")
+          export STAGE_ROLE_ARN="arn:aws:iam::REPLACE_NONPROD_ACCOUNT_ID:role/gitlab-vaas-iac-role"
+          export BASTION_INSTANCE_ID="i-REPLACE-NONPROD-USE1-BASTION"
+          ;;
+
+        "prod:us-west-2")
+          export STAGE_ROLE_ARN="arn:aws:iam::REPLACE_PROD_ACCOUNT_ID:role/gitlab-vaas-iac-role"
+          export BASTION_INSTANCE_ID="i-REPLACE-PROD-USW2-BASTION"
+          ;;
+
+        "prod:us-east-1")
+          export STAGE_ROLE_ARN="arn:aws:iam::REPLACE_PROD_ACCOUNT_ID:role/gitlab-vaas-iac-role"
+          export BASTION_INSTANCE_ID="i-REPLACE-PROD-USE1-BASTION"
+          ;;
+
+        *)
+          echo "ERROR: No mapping found for TARGET_ENV=$TARGET_ENV PRIMARY_REGION=$PRIMARY_REGION"
+          exit 1
+          ;;
+      esac
+
+    - |
+      echo "=== Assume AWS Role via OIDC ==="
+      aws_sts_output="$(aws sts assume-role-with-web-identity \
+        --role-arn "${STAGE_ROLE_ARN}" \
+        --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}-failover" \
+        --web-identity-token "${GITLAB_OIDC_TOKEN}" \
+        --duration-seconds 3600 \
+        --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+        --output text)"
+
+      export AWS_ACCESS_KEY_ID="$(echo "$aws_sts_output" | awk '{print $1}')"
+      export AWS_SECRET_ACCESS_KEY="$(echo "$aws_sts_output" | awk '{print $2}')"
+      export AWS_SESSION_TOKEN="$(echo "$aws_sts_output" | awk '{print $3}')"
+
+      aws sts get-caller-identity
+
+  script:
+    - |
+      echo "=== Encode failover script ==="
+      test -f scripts/failover.py
+      SCRIPT_B64="$(base64 -w 0 scripts/failover.py)"
+      export SCRIPT_B64
+
+    - |
+      echo "=== Send SSM command ==="
+      CMD_ID=$(aws ssm send-command \
+        --region "$AWS_REGION" \
+        --instance-ids "$BASTION_INSTANCE_ID" \
+        --document-name "AWS-RunShellScript" \
+        --parameters commands="[
+          \"set -euo pipefail\",
+          \"echo Running on bastion: \$(hostname)\",
+          \"mkdir -p /tmp/vault-failover\",
+          \"cd /tmp/vault-failover\",
+          \"cat <<'EOF' | base64 -d > failover.py\",
+          \"$SCRIPT_B64\",
+          \"EOF\",
+          \"chmod 700 failover.py\",
+          \"export AWS_REGION='$AWS_REGION'\",
+          \"export TARGET_ENV='$TARGET_ENV'\",
+          \"export PRIMARY_REGION='$PRIMARY_REGION'\",
+          \"export SECONDARY_REGION='$SECONDARY_REGION'\",
+          \"export VAULT_PRIMARY_ADDR='$VAULT_PRIMARY_ADDR'\",
+          \"export VAULT_SECONDARY_ADDR='$VAULT_SECONDARY_ADDR'\",
+          \"export VAULT_SECONDARY_CLUSTER_ID='$VAULT_SECONDARY_CLUSTER_ID'\",
+          \"export VAULT_PRIMARY_TOKEN_SECRET_ID='$VAULT_PRIMARY_TOKEN_SECRET_ID'\",
+          \"export FAILOVER_TOKEN_SECRET_ID='$FAILOVER_TOKEN_SECRET_ID'\",
+          \"export VAULT_TOKEN_JSON_KEY='$VAULT_TOKEN_JSON_KEY'\",
+          \"export FAILOVER_TOKEN_JSON_KEY='$FAILOVER_TOKEN_JSON_KEY'\",
+          \"export POST_PROMOTE_SLEEP_SECONDS='$POST_PROMOTE_SLEEP_SECONDS'\",
+          \"export MIN_STEP_SLEEP_SECONDS='$MIN_STEP_SLEEP_SECONDS'\",
+          \"export MAX_STEP_SLEEP_SECONDS='$MAX_STEP_SLEEP_SECONDS'\",
+          \"export POST_UPDATE_SLEEP_SECONDS='$POST_UPDATE_SLEEP_SECONDS'\",
+          \"export RUN_MODE='$RUN_MODE'\",
+          \"python3 failover.py\"
+        ]" \
+        --query "Command.CommandId" \
+        --output text)
+
+      echo "SSM Command ID: $CMD_ID"
+      export CMD_ID
+
+    - |
+      echo "=== Wait for SSM execution ==="
+      STATUS=""
+      for i in $(seq 1 60); do
+        STATUS=$(aws ssm get-command-invocation \
+          --region "$AWS_REGION" \
+          --command-id "$CMD_ID" \
+          --instance-id "$BASTION_INSTANCE_ID" \
+          --query Status \
+          --output text 2>/dev/null || true)
+
+        echo "Poll $i: Status=$STATUS"
+
+        if [[ "$STATUS" == "Success" || "$STATUS" == "Failed" || "$STATUS" == "TimedOut" || "$STATUS" == "Cancelled" ]]; then
+          break
+        fi
+
+        sleep 10
+      done
+
+    - |
+      echo "=== SSM STDOUT ==="
+      aws ssm get-command-invocation \
+        --region "$AWS_REGION" \
+        --command-id "$CMD_ID" \
+        --instance-id "$BASTION_INSTANCE_ID" \
+        --query StandardOutputContent \
+        --output text || true
+
+      echo "=== SSM STDERR ==="
+      aws ssm get-command-invocation \
+        --region "$AWS_REGION" \
+        --command-id "$CMD_ID" \
+        --instance-id "$BASTION_INSTANCE_ID" \
+        --query StandardErrorContent \
+        --output text || true
+
+      if [ "$STATUS" != "Success" ]; then
+        echo "SSM execution failed with status=$STATUS"
+        exit 1
+      fi
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web" && "$[[ inputs.dr_action ]]" == "failover"'
+      when: manual
+    - when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: never
+
+failback:
+  stage: failback
+  image: amazon/aws-cli:2.15.57
+  when: manual
+  resource_group: "vault-dr-$[[ inputs.target_env ]]-$[[ inputs.primary_region ]]"
+
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://gitlab.corp.zscaler.com
+
+  variables:
+    VAULT_TOKEN_JSON_KEY: "root_token"
+    FAILOVER_TOKEN_JSON_KEY: "token"
+    POST_PROMOTE_SLEEP_SECONDS: "8"
+    MIN_STEP_SLEEP_SECONDS: "2"
+    MAX_STEP_SLEEP_SECONDS: "5"
+    POST_UPDATE_SLEEP_SECONDS: "6"
+
+  before_script:
+    - set -euo pipefail
+    - yum -y install bash coreutils jq python3 >/dev/null 2>&1 || true
+    - aws --version
+
+    - export TARGET_ENV="$[[ inputs.target_env ]]"
+    - export PRIMARY_REGION="$[[ inputs.primary_region ]]"
+    - export RUN_MODE="$[[ inputs.run_mode ]]"
+    - export DR_ACTION="$[[ inputs.dr_action ]]"
+
+    - |
+      echo "=== Selected Inputs ==="
+      echo "TARGET_ENV=$TARGET_ENV"
+      echo "PRIMARY_REGION=$PRIMARY_REGION"
+      echo "RUN_MODE=$RUN_MODE"
+      echo "DR_ACTION=$DR_ACTION"
+
+    - |
+      if [ -z "$DR_ACTION"]; then
+        echo "ERROR: DR_ACTION must be selected"
+        exit 1
+      fi
+
+    - |
+      case "$TARGET_ENV" in
+        dev|nonprod|prod) ;;
+        *)
+          echo "ERROR: Unsupported TARGET_ENV=$TARGET_ENV"
+          exit 1
+          ;;
+      esac
+
+      case "$PRIMARY_REGION" in
+        us-west-2|us-east-1) ;;
+        *)
+          echo "ERROR: Unsupported PRIMARY_REGION=$PRIMARY_REGION"
+          exit 1
+          ;;
+      esac
+
+      case "$RUN_MODE" in
+        validate_only|execute) ;;
+        *)
+          echo "ERROR: Unsupported RUN_MODE=$RUN_MODE"
+          exit 1
+          ;;
+      esac
+
+      case "$DR_ACTION" in
+        failover|failback) ;;
+        *)
+          echo "ERROR: Unsupported DR_ACTION=$DR_ACTION"
+          exit 1
+          ;;
+      esac
+
+    - |
+      echo "=== Resolve Region Mapping ==="
+      case "$PRIMARY_REGION" in
+        us-west-2)
+          export AWS_REGION="us-west-2"
+          export PRIMARY_REGION_SHORT="usw2"
+          export SECONDARY_REGION="us-east-1"
+          export SECONDARY_REGION_SHORT="use1"
+          export VAULT_SECONDARY_CLUSTER_ID="use1"
+          ;;
+        us-east-1)
+          export AWS_REGION="us-east-1"
+          export PRIMARY_REGION_SHORT="use1"
+          export SECONDARY_REGION="us-west-2"
+          export SECONDARY_REGION_SHORT="usw2"
+          export VAULT_SECONDARY_CLUSTER_ID="usw2"
+          ;;
+      esac
+
+    - |
+      echo "=== Derive Vault URLs and Secret IDs ==="
+      export VAULT_PRIMARY_ADDR="https://${PRIMARY_REGION_SHORT}.${TARGET_ENV}.vault.corp.zscaler.com:8200"
+      export VAULT_SECONDARY_ADDR="https://${SECONDARY_REGION_SHORT}.${TARGET_ENV}.vault.corp.zscaler.com:8200"
+
+      export VAULT_PRIMARY_TOKEN_SECRET_ID="vaas/${TARGET_ENV}/primary/root-token"
+      export FAILOVER_TOKEN_SECRET_ID="vaas/${TARGET_ENV}/dr/failover-batch-token"
+
+    - |
+      echo "=== Resolve Bastion and Role Mapping ==="
+      case "${TARGET_ENV}:${PRIMARY_REGION}" in
+        "dev:us-west-2")
+          export STAGE_ROLE_ARN="arn:aws:iam::792014834907:role/gitlab-vaas-iac-role"
+          export BASTION_INSTANCE_ID="i-0957342a4e454e69e"
+          ;;
+
+        "dev:us-east-1")
+          export STAGE_ROLE_ARN="arn:aws:iam::792014834907:role/gitlab-vaas-iac-role"
+          export BASTION_INSTANCE_ID="i-REPLACE-DEV-USE1-BASTION"
+          ;;
+
+        "nonprod:us-west-2")
+          export STAGE_ROLE_ARN="arn:aws:iam::REPLACE_NONPROD_ACCOUNT_ID:role/gitlab-vaas-iac-role"
+          export BASTION_INSTANCE_ID="i-REPLACE-NONPROD-USW2-BASTION"
+          ;;
+
+        "nonprod:us-east-1")
+          export STAGE_ROLE_ARN="arn:aws:iam::REPLACE_NONPROD_ACCOUNT_ID:role/gitlab-vaas-iac-role"
+          export BASTION_INSTANCE_ID="i-REPLACE-NONPROD-USE1-BASTION"
+          ;;
+
+        "prod:us-west-2")
+          export STAGE_ROLE_ARN="arn:aws:iam::REPLACE_PROD_ACCOUNT_ID:role/gitlab-vaas-iac-role"
+          export BASTION_INSTANCE_ID="i-REPLACE-PROD-USW2-BASTION"
+          ;;
+
+        "prod:us-east-1")
+          export STAGE_ROLE_ARN="arn:aws:iam::REPLACE_PROD_ACCOUNT_ID:role/gitlab-vaas-iac-role"
+          export BASTION_INSTANCE_ID="i-REPLACE-PROD-USE1-BASTION"
+          ;;
+
+        *)
+          echo "ERROR: No mapping found for TARGET_ENV=$TARGET_ENV PRIMARY_REGION=$PRIMARY_REGION"
+          exit 1
+          ;;
+      esac
+
+    - |
+      echo "=== Assume AWS Role via OIDC ==="
+      aws_sts_output="$(aws sts assume-role-with-web-identity \
+        --role-arn "${STAGE_ROLE_ARN}" \
+        --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}-failback" \
+        --web-identity-token "${GITLAB_OIDC_TOKEN}" \
+        --duration-seconds 3600 \
+        --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+        --output text)"
+
+      export AWS_ACCESS_KEY_ID="$(echo "$aws_sts_output" | awk '{print $1}')"
+      export AWS_SECRET_ACCESS_KEY="$(echo "$aws_sts_output" | awk '{print $2}')"
+      export AWS_SESSION_TOKEN="$(echo "$aws_sts_output" | awk '{print $3}')"
+
+      aws sts get-caller-identity
+
+  script:
+    - |
+      echo "=== Encode failback script ==="
+      test -f scripts/failback.py
+      SCRIPT_B64="$(base64 -w 0 scripts/failback.py)"
+      export SCRIPT_B64
+
+    - |
+      echo "=== Send SSM command ==="
+      CMD_ID=$(aws ssm send-command \
+        --region "$AWS_REGION" \
+        --instance-ids "$BASTION_INSTANCE_ID" \
+        --document-name "AWS-RunShellScript" \
+        --parameters commands="[
+          \"set -euo pipefail\",
+          \"echo Running on bastion: \$(hostname)\",
+          \"mkdir -p /tmp/vault-failback\",
+          \"cd /tmp/vault-failback\",
+          \"cat <<'EOF' | base64 -d > failback.py\",
+          \"$SCRIPT_B64\",
+          \"EOF\",
+          \"chmod 700 failback.py\",
+          \"export AWS_REGION='$AWS_REGION'\",
+          \"export TARGET_ENV='$TARGET_ENV'\",
+          \"export PRIMARY_REGION='$PRIMARY_REGION'\",
+          \"export SECONDARY_REGION='$SECONDARY_REGION'\",
+          \"export VAULT_PRIMARY_ADDR='$VAULT_PRIMARY_ADDR'\",
+          \"export VAULT_SECONDARY_ADDR='$VAULT_SECONDARY_ADDR'\",
+          \"export VAULT_SECONDARY_CLUSTER_ID='$VAULT_SECONDARY_CLUSTER_ID'\",
+          \"export VAULT_PRIMARY_TOKEN_SECRET_ID='$VAULT_PRIMARY_TOKEN_SECRET_ID'\",
+          \"export FAILOVER_TOKEN_SECRET_ID='$FAILOVER_TOKEN_SECRET_ID'\",
+          \"export VAULT_TOKEN_JSON_KEY='$VAULT_TOKEN_JSON_KEY'\",
+          \"export FAILOVER_TOKEN_JSON_KEY='$FAILOVER_TOKEN_JSON_KEY'\",
+          \"export POST_PROMOTE_SLEEP_SECONDS='$POST_PROMOTE_SLEEP_SECONDS'\",
+          \"export MIN_STEP_SLEEP_SECONDS='$MIN_STEP_SLEEP_SECONDS'\",
+          \"export MAX_STEP_SLEEP_SECONDS='$MAX_STEP_SLEEP_SECONDS'\",
+          \"export POST_UPDATE_SLEEP_SECONDS='$POST_UPDATE_SLEEP_SECONDS'\",
+          \"export RUN_MODE='$RUN_MODE'\",
+          \"python3 failback.py\"
+        ]" \
+        --query "Command.CommandId" \
+        --output text)
+
+      echo "SSM Command ID: $CMD_ID"
+      export CMD_ID
+
+    - |
+      echo "=== Wait for SSM execution ==="
+      STATUS=""
+      for i in $(seq 1 60); do
+        STATUS=$(aws ssm get-command-invocation \
+          --region "$AWS_REGION" \
+          --command-id "$CMD_ID" \
+          --instance-id "$BASTION_INSTANCE_ID" \
+          --query Status \
+          --output text 2>/dev/null || true)
+
+        echo "Poll $i: Status=$STATUS"
+
+        if [[ "$STATUS" == "Success" || "$STATUS" == "Failed" || "$STATUS" == "TimedOut" || "$STATUS" == "Cancelled" ]]; then
+          break
+        fi
+
+        sleep 10
+      done
+
+    - |
+      echo "=== SSM STDOUT ==="
+      aws ssm get-command-invocation \
+        --region "$AWS_REGION" \
+        --command-id "$CMD_ID" \
+        --instance-id "$BASTION_INSTANCE_ID" \
+        --query StandardOutputContent \
+        --output text || true
+
+      echo "=== SSM STDERR ==="
+      aws ssm get-command-invocation \
+        --region "$AWS_REGION" \
+        --command-id "$CMD_ID" \
+        --instance-id "$BASTION_INSTANCE_ID" \
+        --query StandardErrorContent \
+        --output text || true
+
+      if [ "$STATUS" != "Success" ]; then
+        echo "SSM execution failed with status=$STATUS"
+        exit 1
+      fi
+
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web" && "$[[ inputs.dr_action ]]" == "failback"'
+      when: manual
+    - when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: never
