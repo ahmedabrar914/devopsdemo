@@ -1,0 +1,25 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "S3Access",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:GetObjectVersion",
+        "s3:PutObjectTagging",
+        "s3:PutObjectRetention"
+      ],
+      "Resource": "arn:aws:s3:::vault-quarantine-artifacts/*"
+    },
+    {
+      "Sid": "DDBAccess",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:PutItem"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
