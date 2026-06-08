@@ -6,7 +6,6 @@ import urllib.parse
 from datetime import datetime, timedelta, timezone
 
 import boto3
-from botocore.exceptions import ClientError
 
 
 s3 = boto3.client("s3")
@@ -51,12 +50,26 @@ def get_latest_ent_version() -> str:
     versions = list(set(versions))
 
     versions.sort(
-        key=lambda v: tuple(
-            map(int, v.replace("+ent", "").split("."))
-        )
+        key=lambda v: tuple(map(int, v.replace("+ent", "").split(".")))
     )
 
     return versions[-1]
+
+
+def version_already_processed(version: str) -> bool:
+    response = ddb.query(
+        TableName=INTEGRITY_TABLE,
+        IndexName="version-index",
+        KeyConditionExpression="#v = :version",
+        ExpressionAttributeNames={
+            "#v": "version"
+        },
+        ExpressionAttributeValues={
+            ":version": {"S": version}
+        }
+    )
+
+    return len(response.get("Items", [])) > 0
 
 
 def parse_expected_sha(sums_text: str, zip_name: str) -> str:
@@ -67,20 +80,6 @@ def parse_expected_sha(sums_text: str, zip_name: str) -> str:
             return parts[0].lower()
 
     raise RuntimeError(f"SHA256 checksum not found for {zip_name}")
-
-
-def s3_object_exists(bucket: str, key: str) -> bool:
-    try:
-        s3.head_object(Bucket=bucket, Key=key)
-        return True
-
-    except ClientError as e:
-        error_code = e.response["Error"]["Code"]
-
-        if error_code in ["404", "NoSuchKey", "NotFound"]:
-            return False
-
-        raise
 
 
 def upload_locked_object(
@@ -133,6 +132,13 @@ def lambda_handler(event, context):
 
     print(f"Latest Vault Enterprise version: {latest_version}")
 
+    if version_already_processed(latest_version):
+        return {
+            "status": "skipped",
+            "message": "Latest Vault Enterprise version already processed",
+            "version": latest_version
+        }
+
     zip_name = f"vault_{latest_version}_{ARCH}.zip"
     sums_name = f"vault_{latest_version}_SHA256SUMS"
 
@@ -143,14 +149,6 @@ def lambda_handler(event, context):
 
     zip_key = f"{QUARANTINE_PREFIX}/{latest_version}/{zip_name}"
     sums_key = f"{QUARANTINE_PREFIX}/{latest_version}/{sums_name}"
-
-    # if s3_object_exists(BUCKET_NAME, zip_key):
-    #     return {
-    #         "status": "skipped",
-    #         "message": "Latest version already exists in quarantine bucket",
-    #         "version": latest_version,
-    #         "s3_key": zip_key
-    #     }
 
     print(f"Downloading SHA256SUMS: {sums_url}")
     sums_text = read_url_text(sums_url)
