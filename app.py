@@ -1,104 +1,227 @@
-import boto3
+import os
 import re
+import hashlib
 import urllib.request
-from packaging.version import Version
+import urllib.parse
+from datetime import datetime, timedelta, timezone
 
-BUCKET_NAME = "your-s3-bucket-name"
-PREFIX = "hashicorp/vault"
-RELEASE_URL = "https://releases.hashicorp.com/vault/"
+import boto3
+from botocore.exceptions import ClientError
+
 
 s3 = boto3.client("s3")
+ddb = boto3.client("dynamodb")
+
+RELEASES_URL = "https://releases.hashicorp.com/vault/"
+
+BUCKET_NAME = os.environ["BUCKET_NAME"]
+QUARANTINE_PREFIX = os.environ.get("QUARANTINE_PREFIX", "vault")
+INTEGRITY_TABLE = os.environ["INTEGRITY_TABLE"]
+
+ARCH = os.environ.get("ARCH", "linux_amd64")
+RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "30"))
+OBJECT_LOCK_MODE = os.environ.get("OBJECT_LOCK_MODE", "GOVERNANCE")
 
 
-def get_url_content(url):
-    with urllib.request.urlopen(url, timeout=30) as response:
+def read_url_text(url: str) -> str:
+    with urllib.request.urlopen(url, timeout=60) as response:
         return response.read().decode("utf-8")
 
 
-def download_binary(url):
-    with urllib.request.urlopen(url, timeout=120) as response:
+def read_url_bytes(url: str) -> bytes:
+    with urllib.request.urlopen(url, timeout=180) as response:
         return response.read()
 
 
-def get_latest_ent_version():
-    html = get_url_content(RELEASE_URL)
-
-    pattern = r'vault_(\d+\.\d+\.\d+)\+ent/'
-    versions = re.findall(pattern, html)
-
-    if not versions:
-        raise Exception("No Vault Enterprise versions found")
-
-    latest = sorted(set(versions), key=Version, reverse=True)[0]
-    return latest
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
-def get_last_downloaded_version():
-    key = f"{PREFIX}/last_version.txt"
+def get_latest_ent_version() -> str:
+    html = read_url_text(RELEASES_URL)
 
-    try:
-        obj = s3.get_object(Bucket=BUCKET_NAME, Key=key)
-        return obj["Body"].read().decode("utf-8").strip()
-    except s3.exceptions.NoSuchKey:
-        return None
-    except Exception:
-        return None
-
-
-def save_last_downloaded_version(version):
-    s3.put_object(
-        Bucket=BUCKET_NAME,
-        Key=f"{PREFIX}/last_version.txt",
-        Body=version.encode("utf-8")
+    versions = re.findall(
+        r'href="/vault/([0-9]+\.[0-9]+\.[0-9]+\+ent)/"',
+        html
     )
 
+    if not versions:
+        raise RuntimeError("No stable Vault +ent version found")
 
-def upload_file_to_s3(filename, content, version):
-    key = f"{PREFIX}/{version}/{filename}"
+    versions = list(set(versions))
+
+    versions.sort(
+        key=lambda v: tuple(
+            map(int, v.replace("+ent", "").split("."))
+        )
+    )
+
+    return versions[-1]
+
+
+def parse_expected_sha(sums_text: str, zip_name: str) -> str:
+    for line in sums_text.splitlines():
+        parts = line.strip().split()
+
+        if len(parts) >= 2 and parts[-1] == zip_name:
+            return parts[0].lower()
+
+    raise RuntimeError(f"SHA256 checksum not found for {zip_name}")
+
+
+def s3_object_exists(bucket: str, key: str) -> bool:
+    try:
+        s3.head_object(Bucket=bucket, Key=key)
+        return True
+
+    except ClientError as e:
+        error_code = e.response["Error"]["Code"]
+
+        if error_code in ["404", "NoSuchKey", "NotFound"]:
+            return False
+
+        raise
+
+
+def upload_locked_object(
+    key: str,
+    body: bytes,
+    metadata: dict,
+    tags: dict
+):
+    retain_until = datetime.now(timezone.utc) + timedelta(days=RETENTION_DAYS)
 
     s3.put_object(
         Bucket=BUCKET_NAME,
         Key=key,
-        Body=content
+        Body=body,
+        Metadata=metadata,
+        Tagging=urllib.parse.urlencode(tags),
+        ObjectLockMode=OBJECT_LOCK_MODE,
+        ObjectLockRetainUntilDate=retain_until
     )
 
-    print(f"Uploaded s3://{BUCKET_NAME}/{key}")
+
+def put_integrity_record(
+    artifact_key: str,
+    version: str,
+    artifact_name: str,
+    sha256: str,
+    source_url: str,
+    status: str,
+    retention_until: str
+):
+    ddb.put_item(
+        TableName=INTEGRITY_TABLE,
+        Item={
+            "artifact_key": {"S": artifact_key},
+            "version": {"S": version},
+            "artifact_name": {"S": artifact_name},
+            "sha256": {"S": sha256},
+            "source_url": {"S": source_url},
+            "status": {"S": status},
+            "retention_until": {"S": retention_until},
+            "created_at": {
+                "S": datetime.now(timezone.utc).isoformat()
+            }
+        }
+    )
 
 
 def lambda_handler(event, context):
     latest_version = get_latest_ent_version()
-    last_version = get_last_downloaded_version()
 
     print(f"Latest Vault Enterprise version: {latest_version}")
-    print(f"Last downloaded version: {last_version}")
 
-    if latest_version == last_version:
+    zip_name = f"vault_{latest_version}_{ARCH}.zip"
+    sums_name = f"vault_{latest_version}_SHA256SUMS"
+
+    release_base_url = f"{RELEASES_URL}{latest_version}/"
+
+    zip_url = f"{release_base_url}{urllib.parse.quote(zip_name)}"
+    sums_url = f"{release_base_url}{urllib.parse.quote(sums_name)}"
+
+    zip_key = f"{QUARANTINE_PREFIX}/{latest_version}/{zip_name}"
+    sums_key = f"{QUARANTINE_PREFIX}/{latest_version}/{sums_name}"
+
+    if s3_object_exists(BUCKET_NAME, zip_key):
         return {
             "status": "skipped",
-            "message": "No new Vault Enterprise version found",
-            "version": latest_version
+            "message": "Latest version already exists in quarantine bucket",
+            "version": latest_version,
+            "s3_key": zip_key
         }
 
-    base_name = f"vault_{latest_version}+ent"
-    version_url = f"{RELEASE_URL}{base_name}/"
+    print(f"Downloading SHA256SUMS: {sums_url}")
+    sums_text = read_url_text(sums_url)
 
-    files_to_download = [
-        f"{base_name}_SHA256SUMS",
-        f"{base_name}_linux_amd64.zip"
-    ]
+    print(f"Downloading ZIP: {zip_url}")
+    zip_bytes = read_url_bytes(zip_url)
 
-    for filename in files_to_download:
-        file_url = f"{version_url}{filename}"
-        print(f"Downloading {file_url}")
+    expected_sha = parse_expected_sha(sums_text, zip_name)
+    actual_sha = sha256_bytes(zip_bytes)
 
-        content = download_binary(file_url)
-        upload_file_to_s3(filename, content, latest_version)
+    print(f"Expected SHA256: {expected_sha}")
+    print(f"Actual SHA256:   {actual_sha}")
 
-    save_last_downloaded_version(latest_version)
+    if expected_sha != actual_sha:
+        raise RuntimeError(
+            f"Checksum mismatch. expected={expected_sha}, actual={actual_sha}"
+        )
+
+    print("Checksum matched. Uploading to quarantine bucket.")
+
+    retention_until = (
+        datetime.now(timezone.utc) + timedelta(days=RETENTION_DAYS)
+    ).isoformat()
+
+    upload_locked_object(
+        key=zip_key,
+        body=zip_bytes,
+        metadata={
+            "version": latest_version,
+            "sha256": expected_sha,
+            "source": zip_url
+        },
+        tags={
+            "scan_status": "pending",
+            "integrity": "verified",
+            "artifact": "vault"
+        }
+    )
+
+    upload_locked_object(
+        key=sums_key,
+        body=sums_text.encode("utf-8"),
+        metadata={
+            "version": latest_version,
+            "source": sums_url
+        },
+        tags={
+            "scan_status": "pending",
+            "integrity": "verified",
+            "artifact": "vault"
+        }
+    )
+
+    put_integrity_record(
+        artifact_key=zip_key,
+        version=latest_version,
+        artifact_name=zip_name,
+        sha256=expected_sha,
+        source_url=zip_url,
+        status="verified_uploaded_locked",
+        retention_until=retention_until
+    )
 
     return {
         "status": "success",
-        "message": "New Vault Enterprise binaries uploaded",
         "version": latest_version,
-        "files": files_to_download
+        "zip_file": zip_name,
+        "sha256_file": sums_name,
+        "sha256": expected_sha,
+        "zip_s3_key": zip_key,
+        "sums_s3_key": sums_key,
+        "object_lock_mode": OBJECT_LOCK_MODE,
+        "retention_days": RETENTION_DAYS
     }
