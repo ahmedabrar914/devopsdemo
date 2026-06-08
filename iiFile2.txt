@@ -1,1 +1,6 @@
-demo
+BUCKET_NAME=vault-quarantine-artifacts
+QUARANTINE_PREFIX=vault
+INTEGRITY_TABLE=vault-artifact-integrity
+ARCH=linux_amd64
+RETENTION_DAYS=30
+OBJECT_LOCK_MODE=GOVERNANCE
