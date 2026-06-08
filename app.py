@@ -144,13 +144,13 @@ def lambda_handler(event, context):
     zip_key = f"{QUARANTINE_PREFIX}/{latest_version}/{zip_name}"
     sums_key = f"{QUARANTINE_PREFIX}/{latest_version}/{sums_name}"
 
-    if s3_object_exists(BUCKET_NAME, zip_key):
-        return {
-            "status": "skipped",
-            "message": "Latest version already exists in quarantine bucket",
-            "version": latest_version,
-            "s3_key": zip_key
-        }
+    # if s3_object_exists(BUCKET_NAME, zip_key):
+    #     return {
+    #         "status": "skipped",
+    #         "message": "Latest version already exists in quarantine bucket",
+    #         "version": latest_version,
+    #         "s3_key": zip_key
+    #     }
 
     print(f"Downloading SHA256SUMS: {sums_url}")
     sums_text = read_url_text(sums_url)
