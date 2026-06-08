@@ -1,1 +1,19 @@
-test
+resource "aws_s3_bucket_policy" "deny_delete" {
+  bucket = aws_s3_bucket.quarantine.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "DenyObjectDeleteForEveryone"
+        Effect = "Deny"
+        Principal = "*"
+        Action = [
+          "s3:DeleteObject",
+          "s3:DeleteObjectVersion"
+        ]
+        Resource = "${aws_s3_bucket.quarantine.arn}/*"
+      }
+    ]
+  })
+}
