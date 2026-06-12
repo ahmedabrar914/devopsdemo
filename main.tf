@@ -4,9 +4,38 @@ data "archive_file" "lambda_zip" {
   output_path = "${path.module}/lambda_src/vault_release_downloader.zip"
 }
 
+locals {
+  approved_bucket_name         = coalesce(var.approved_bucket_name, "${var.bucket_name}-approved")
+  rl_scanner_input_bucket_name = split("/", trimprefix(var.rl_scanner_input_s3_location, "s3://"))[0]
+}
+
 resource "aws_s3_bucket" "quarantine" {
   bucket              = var.bucket_name
   object_lock_enabled = true
+}
+
+resource "aws_s3_bucket" "approved_artifact" {
+  bucket = local.approved_bucket_name
+}
+
+resource "aws_s3_bucket_policy" "deny_delete" {
+  bucket = aws_s3_bucket.approved_artifact.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "DenyObjectDeleteForEveryone"
+        Effect    = "Deny"
+        Principal = "*"
+        Action = [
+          "s3:DeleteObject",
+          "s3:DeleteObjectVersion"
+        ]
+        Resource = "${aws_s3_bucket.approved_artifact.arn}/*"
+      }
+    ]
+  })
 }
 
 resource "aws_s3_bucket_versioning" "quarantine" {
@@ -158,4 +187,211 @@ resource "aws_lambda_permission" "allow_eventbridge" {
   function_name = aws_lambda_function.this.function_name
   principal     = "events.amazonaws.com"
   source_arn    = aws_cloudwatch_event_rule.schedule.arn
+}
+
+
+
+############################################
+# CloudWatch Log Groups
+############################################
+resource "aws_cloudwatch_log_group" "dispatch" {
+  name              = "/aws/lambda/${var.rl_name_prefix}-dispatch"
+  retention_in_days = 30
+}
+
+resource "aws_cloudwatch_log_group" "promoter" {
+  name              = "/aws/lambda/${var.rl_name_prefix}-promoter"
+  retention_in_days = 30
+}
+
+############################################
+# IAM ROLE 1: Dispatch Lambda role + policy
+############################################
+resource "aws_iam_role" "dispatch_role" {
+  name = "${var.rl_name_prefix}-dispatch-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid    = "LambdaAssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "lambda.amazonaws.com"
+      }
+      Action = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "dispatch_policy" {
+  name = "${var.rl_name_prefix}-dispatch-policy"
+  role = aws_iam_role.dispatch_role.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "WriteDispatchLogs"
+        Effect   = "Allow"
+        Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
+        Resource = "${aws_cloudwatch_log_group.dispatch.arn}:*"
+      },
+      {
+        Sid      = "SendScanJobs"
+        Effect   = "Allow"
+        Action   = ["sqs:SendMessage"]
+        Resource = aws_sqs_queue.scan_jobs.arn
+      }
+    ]
+  })
+}
+
+############################################
+# IAM ROLE 2: Promoter Lambda role + policy
+############################################
+resource "aws_iam_role" "promoter_role" {
+  name = "${var.rl_name_prefix}-promoter-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid    = "LambdaAssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "lambda.amazonaws.com"
+      }
+      Action = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "promoter_policy" {
+  name = "${var.rl_name_prefix}-promoter-policy"
+  role = aws_iam_role.promoter_role.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "WritePromoterLogs"
+        Effect   = "Allow"
+        Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
+        Resource = "${aws_cloudwatch_log_group.promoter.arn}:*"
+      },
+      {
+        Sid      = "ConsumeScanResults"
+        Effect   = "Allow"
+        Action   = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"]
+        Resource = aws_sqs_queue.scan_results.arn
+      },
+      {
+        Sid    = "S3ReadTagCopyDeleteSource"
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:GetObjectTagging",
+          "s3:PutObjectTagging",
+          "s3:PutObject",
+          "s3:PutObjectTagging",
+          "s3:DeleteObject"
+        ]
+        Resource = [
+          "${aws_s3_bucket.quarantine.arn}/*",
+          "${aws_s3_bucket.approved_artifact.arn}/*"
+        ]
+      },
+      {
+        Sid    = "S3ListBucketsForTaggingChecks"
+        Effect = "Allow"
+        Action = [
+          "s3:ListBucket"
+        ]
+        Resource = [
+          aws_s3_bucket.quarantine.arn,
+          aws_s3_bucket.approved_artifact.arn
+        ]
+      }
+    ]
+  })
+}
+
+############################################
+# IAM ROLE 3: EC2 worker role + policy + profile
+############################################
+resource "aws_iam_role" "worker_role" {
+  name = "${var.rl_name_prefix}-worker-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid    = "EC2AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "ec2.amazonaws.com"
+      }
+      Action = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "worker_policy" {
+  name = "${var.rl_name_prefix}-worker-policy"
+  role = aws_iam_role.worker_role.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "PollJobsAndPublishResults"
+        Effect = "Allow"
+        Action = [
+          "sqs:ReceiveMessage",
+          "sqs:DeleteMessage",
+          "sqs:GetQueueAttributes",
+          "sqs:SendMessage"
+        ]
+        Resource = [
+          aws_sqs_queue.scan_jobs.arn,
+          aws_sqs_queue.scan_results.arn
+        ]
+      },
+      {
+        Sid      = "ReadArtifacts"
+        Effect   = "Allow"
+        Action   = ["s3:GetObject"]
+        Resource = "${aws_s3_bucket.quarantine.arn}/*"
+      },
+      {
+        Sid    = "RlStaticBucketRead"
+        Effect = "Allow"
+        Action = ["s3:GetObject", "s3:ListBucket"]
+        Resource = [
+          "arn:aws:s3:::${var.rl_static_artifacts_bucket_name}",
+          "arn:aws:s3:::${var.rl_static_artifacts_bucket_name}/*"
+        ]
+      },
+      {
+        Sid    = "RlScannerBucketReadWrite"
+        Effect = "Allow"
+        Action = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"]
+        Resource = [
+          "arn:aws:s3:::${local.rl_scanner_input_bucket_name}",
+          "arn:aws:s3:::${local.rl_scanner_input_bucket_name}/*"
+        ]
+      },
+      {
+        Sid    = "ReadRlSecrets"
+        Effect = "Allow"
+        Action = ["secretsmanager:GetSecretValue"]
+        Resource = [
+          var.rl_license_secret_arn,
+          var.rl_site_key_secret_arn
+        ]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_instance_profile" "worker_profile" {
+  name = "${var.rl_name_prefix}-worker-profile"
+  role = aws_iam_role.worker_role.name
+}
+
+resource "aws_iam_role_policy_attachment" "worker_ssm_core" {
+  role       = aws_iam_role.worker_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
