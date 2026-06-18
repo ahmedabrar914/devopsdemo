@@ -1,1 +1,91 @@
-test
+Good. Local syslog works, but KFuse not visible means one of these is failing:
+
+filelog receiver -> logs pipeline -> otlphttp/kfuse exporter
+
+Run these checks now.
+
+1. Check ZOTEL agent logs for filelog/export errors
+
+sudo tail -200 /sc/zotelagent/logs/zotelagent.log.json | grep -iE "error|filelog|logs|export|permission|syslog|kern|auth"
+
+Also:
+
+sudo journalctl -u zotelagent -n 200 --no-pager
+
+⸻
+
+2. Check if config actually loaded the logs pipeline
+
+Run:
+
+sudo grep -n "filelog/system\|logs:" /sc/zotelagent/conf/config.yaml
+
+Expected output should show both:
+
+filelog/system:
+logs:
+
+⸻
+
+3. Permission issue likely
+
+Your files are owned by:
+
+syslog:adm
+-rw-r-----
+
+If zotelagent runs as non-root, it cannot read them unless it is in adm.
+
+Check service user:
+
+ps -ef | grep zotelagent | grep -v grep
+
+If it runs as zotel, add:
+
+sudo usermod -aG adm zotel
+sudo systemctl restart zotelagent
+
+If it runs as another user, add that user to adm.
+
+⸻
+
+4. Test with start_at: beginning
+
+Because you used start_at: end, it may only read logs after receiver is fully started. For testing, change temporarily:
+
+start_at: beginning
+
+Restart:
+
+sudo systemctl restart zotelagent
+
+Then generate fresh log:
+
+logger "KFUSE_TEST_VAULT_SYSLOG_003 $(date)"
+
+⸻
+
+5. Very important: your exporter may not send logs
+
+Check if otlphttp/kfuse is defined for logs or only metrics/traces. Run:
+
+sudo grep -R "otlphttp/kfuse" -n /sc/zotelagent/conf
+sudo grep -R "ZOTEL_SIEM" -n /sc/zotelagent/conf /etc/systemd/system/zotelagent.conf
+
+Because your env shows:
+
+ZOTEL_SIEM_ENABLED=true
+ZOTEL_SIEM_LOGS_ENDPOINT=chronicle.googleapis.com
+
+So logs may need a different exporter, not otlphttp/kfuse.
+
+Most likely next fix is either:
+
+exporters: [otlphttp/kfuse]
+
+or a SIEM/Chronicle exporter configured by ZOTEL.
+
+Share output of:
+
+sudo tail -100 /sc/zotelagent/logs/zotelagent.log.json
+sudo grep -R "ZOTEL_SIEM\|otlphttp/kfuse\|chronicle\|logs" -n /sc/zotelagent/conf /etc/systemd/system/zotelagent.conf
