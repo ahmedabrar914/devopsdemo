@@ -1,1 +1,44 @@
-test demo
+function configure_zotel_system_logs {
+  log "INFO" "Configuring Zotel system logs receiver"
+
+  sudo cp /sc/zotelagent/conf/role-config.yaml /sc/zotelagent/conf/role-config.yaml.bak || true
+
+  sudo tee /sc/zotelagent/conf/role-config.yaml >/dev/null <<EOF
+receivers:
+  filelog/vault_as_a_service_1:
+    include:
+      - /var/log/vault/vault-audit.log
+    multiline:
+      line_start_pattern: '^\{'
+    storage: file_storage/otel_pq
+    retry_on_failure:
+      enabled: true
+      max_elapsed_time: 0
+    operators:
+      - type: copy
+        from: attributes['log.file.name']
+        to: resource['service.name']
+
+  filelog/system_logs:
+    include:
+      - /var/log/syslog
+      - /var/log/kern.log
+      - /var/log/auth.log
+    start_at: end
+    include_file_path: true
+    include_file_name: true
+    operators:
+      - type: copy
+        from: attributes['log.file.name']
+        to: resource['service.name']
+
+service:
+  pipelines:
+    logs/vault_as_a_service_1:
+      receivers: [filelog/vault_as_a_service_1, filelog/system_logs]
+      processors: [memory_limiter,resourcedetection,resource,batch]
+      exporters: [otlphttp/kfuse,otlphttp/siem]
+EOF
+
+  sudo usermod -aG adm zotel || true
+}
