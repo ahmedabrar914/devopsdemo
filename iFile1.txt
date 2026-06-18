@@ -1,9 +1,20 @@
-function configure_zotel_role_config {
-  log "INFO" "Downloading zotel role-config.yaml from S3"
+function restart_zotelagent {
+  log "INFO" "Adding zotel user to vault/adm group and restarting zotelagent"
 
-  aws s3 cp "${zotel_role_config_s3_uri}" \
-    "$ZOTEL_INSTALL_DIR/zotelagent/conf/role-config.yaml"
-
+  sudo usermod -aG "$VAULT_GROUP" zotel || true
   sudo usermod -aG adm zotel || true
+
+  sudo install -d -m 750 -o "$VAULT_USER" -g "$VAULT_GROUP" /var/log/vault || true
+
+  if [ ! -f /var/log/vault/vault-audit.log ]; then
+    sudo install -m 640 -o "$VAULT_USER" -g "$VAULT_GROUP" /dev/null /var/log/vault/vault-audit.log || true
+  else
+    sudo chown "$VAULT_USER:$VAULT_GROUP" /var/log/vault/vault-audit.log || true
+    sudo chmod 640 /var/log/vault/vault-audit.log || true
+  fi
+
+  aws s3 cp "$ZOTEL_ROLE_CONFIG" "$ZOTEL_INSTALL_DIR/zotelagent/conf/role-config.yaml" || true
   sudo chmod o+r /var/log/syslog /var/log/kern.log /var/log/auth.log 2>/dev/null || true
+
+  sudo systemctl restart zotelagent || true
 }
