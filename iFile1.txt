@@ -1,1 +1,9 @@
-demo test
+function configure_zotel_role_config {
+  log "INFO" "Downloading zotel role-config.yaml from S3"
+
+  aws s3 cp "${zotel_role_config_s3_uri}" \
+    "$ZOTEL_INSTALL_DIR/zotelagent/conf/role-config.yaml"
+
+  sudo usermod -aG adm zotel || true
+  sudo chmod o+r /var/log/syslog /var/log/kern.log /var/log/auth.log 2>/dev/null || true
+}
