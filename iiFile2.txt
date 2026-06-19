@@ -1,1 +1,94 @@
-demo
+Use this approach:
+
+Vault journalctl logs
+        ↓
+rsyslog imjournal
+        ↓
+/var/log/vault/vault-server.log
+        ↓
+zotel filelog receiver
+        ↓
+KFuse
+
+1. Enable rsyslog journal input
+
+Create config:
+
+sudo tee /etc/rsyslog.d/10-vault-journal.conf >/dev/null <<'EOF'
+module(load="imjournal" StateFile="imjournal.state")
+if ($programname == "vault") then /var/log/vault/vault-server.log
+& stop
+EOF
+
+2. Create log file with permission
+
+sudo mkdir -p /var/log/vault
+sudo touch /var/log/vault/vault-server.log
+sudo chown syslog:adm /var/log/vault/vault-server.log
+sudo chmod 640 /var/log/vault/vault-server.log
+
+3. Restart rsyslog
+
+sudo systemctl restart rsyslog
+sudo systemctl status rsyslog
+
+4. Test if vault journal logs are now written to file
+
+Restart Vault to generate service logs:
+
+sudo systemctl restart vault
+sudo journalctl -u vault -n 20
+sudo tail -20 /var/log/vault/vault-server.log
+
+You should see Vault service logs in:
+
+/var/log/vault/vault-server.log
+
+5. Add this file in role-config.yaml
+
+Add new receiver:
+
+  filelog/vault_server_logs:
+    include:
+      - /var/log/vault/vault-server.log
+    start_at: end
+    include_file_path: true
+    include_file_name: true
+    storage: file_storage/otel_pq
+    retry_on_failure:
+      enabled: true
+      max_elapsed_time: 0
+    operators:
+      - type: copy
+        from: attributes['log.file.name']
+        to: resource['service.name']
+
+Then add it to your existing pipeline receivers:
+
+receivers: [filelog/vault_as_a_service_1, filelog/system_logs, filelog/vault_server_logs]
+
+6. Give zotel permission to read it
+
+sudo usermod -aG adm zotel
+sudo chmod o+r /var/log/vault/vault-server.log
+
+7. Restart zotel
+
+sudo systemctl restart zotelagent
+sudo systemctl status zotelagent
+
+8. Verify
+
+Generate fresh Vault logs:
+
+sudo systemctl restart vault
+sudo journalctl -u vault -n 20
+sudo tail -20 /var/log/vault/vault-server.log
+
+Then in KFuse search:
+
+cloud_token="vault-as-service-dev" AND vault-server.log
+
+or:
+
+cloud_token="vault-as-service-dev" AND "HashiCorp Vault"
