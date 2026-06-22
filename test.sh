@@ -199,47 +199,65 @@ function patch_zotel_role_config {
 
   sudo mv "$ROLE_CONFIG.tmp" "$ROLE_CONFIG"
 
-  # Add missing pipelines before logs/vault_as_a_service_1:
+  # Add missing pipelines after logs/vault_as_a_service_1 block
   sudo awk '
-    BEGIN {
-      has_system_pipeline=0
-      has_vault_server_pipeline=0
+    /^    logs\/system_logs:/ { has_system_pipeline=1 }
+    /^    logs\/vault_server_logs:/ { has_vault_server_pipeline=1 }
+
+    /^    logs\/vault_as_a_service_1:/ {
+      in_vault_pipeline=1
     }
 
-    /^    logs\/system_logs:/ {
-      has_system_pipeline=1
-    }
+    in_vault_pipeline && /^    logs\// && $0 !~ /^    logs\/vault_as_a_service_1:/ {
+      if (!done) {
+        if (!has_vault_server_pipeline) {
+          print "    logs/vault_server_logs:"
+          print "      receivers: [filelog/vault_server_logs]"
+          print "      processors: [memory_limiter,resourcedetection,resource,batch]"
+          print "      exporters: [otlphttp/kfuse]"
+          print ""
+        }
 
-    /^    logs\/vault_server_logs:/ {
-      has_vault_server_pipeline=1
-    }
+        if (!has_system_pipeline) {
+          print "    logs/system_logs:"
+          print "      receivers: [filelog/system_logs]"
+          print "      processors: [memory_limiter,resourcedetection,resource,batch]"
+          print "      exporters: [otlphttp/kfuse]"
+          print ""
+        }
 
-    /^    logs\/vault_as_a_service_1:/ && !done {
-      if (!has_vault_server_pipeline) {
-        print "    logs/vault_server_logs:"
-        print "      receivers: [filelog/vault_server_logs]"
-        print "      processors: [memory_limiter,resourcedetection,resource,batch]"
-        print "      exporters: [otlphttp/kfuse]"
-        print ""
+        done=1
       }
 
-      if (!has_system_pipeline) {
-        print "    logs/system_logs:"
-        print "      receivers: [filelog/system_logs]"
-        print "      processors: [memory_limiter,resourcedetection,resource,batch]"
-        print "      exporters: [otlphttp/kfuse]"
-        print ""
-      }
-
-      done=1
+      in_vault_pipeline=0
     }
 
     { print }
+
+    END {
+      if (in_vault_pipeline && !done) {
+        if (!has_vault_server_pipeline) {
+          print "    logs/vault_server_logs:"
+          print "      receivers: [filelog/vault_server_logs]"
+          print "      processors: [memory_limiter,resourcedetection,resource,batch]"
+          print "      exporters: [otlphttp/kfuse]"
+          print ""
+        }
+
+        if (!has_system_pipeline) {
+          print "    logs/system_logs:"
+          print "      receivers: [filelog/system_logs]"
+          print "      processors: [memory_limiter,resourcedetection,resource,batch]"
+          print "      exporters: [otlphttp/kfuse]"
+        }
+      }
+    }
   ' "$ROLE_CONFIG" | sudo tee "$ROLE_CONFIG.tmp" >/dev/null
 
   sudo mv "$ROLE_CONFIG.tmp" "$ROLE_CONFIG"
 
   log "INFO" "Completed Zotel role-config patch"
 }
+ 
 
 Key point: do not overwrite role-config. Only patch missing receivers and pipelines.
