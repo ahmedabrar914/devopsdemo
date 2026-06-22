@@ -136,14 +136,11 @@ sudo rsyslogd -N1
 sudo systemctl restart vault
 sudo tail -20 /var/log/vault/vault-server.log
 
-In KFuse search:
-
-source="vault-server.log"
 
 function patch_zotel_role_config {
   local ROLE_CONFIG="/sc/zotelagent/conf/role-config.yaml"
 
-  log "INFO" "Patching Zotel role-config if system/vault-server logs are missing"
+  log "INFO" "Patching Zotel role-config"
 
   if [ ! -f "$ROLE_CONFIG" ]; then
     log "WARN" "$ROLE_CONFIG not found, skipping patch"
@@ -154,8 +151,11 @@ function patch_zotel_role_config {
 
   # Add missing receivers before service:
   sudo awk '
+    /filelog\/system_logs:/ { has_system_receiver=1 }
+    /filelog\/vault_server_logs:/ { has_vault_server_receiver=1 }
+
     /^service:/ && !done {
-      if (!has_system) {
+      if (!has_system_receiver) {
         print "  filelog/system_logs:"
         print "    include:"
         print "      - /var/log/syslog"
@@ -174,7 +174,7 @@ function patch_zotel_role_config {
         print ""
       }
 
-      if (!has_vault_server) {
+      if (!has_vault_server_receiver) {
         print "  filelog/vault_server_logs:"
         print "    include:"
         print "      - /var/log/vault/vault-server.log"
@@ -194,9 +194,6 @@ function patch_zotel_role_config {
       done=1
     }
 
-    /filelog\/system_logs:/ { has_system=1 }
-    /filelog\/vault_server_logs:/ { has_vault_server=1 }
-
     { print }
   ' "$ROLE_CONFIG" | sudo tee "$ROLE_CONFIG.tmp" >/dev/null
 
@@ -205,20 +202,20 @@ function patch_zotel_role_config {
   # Add missing pipelines before logs/vault_as_a_service_1:
   sudo awk '
     BEGIN {
-      add_system=1
-      add_vault_server=1
+      has_system_pipeline=0
+      has_vault_server_pipeline=0
     }
 
-    /logs\/system_logs:/ {
-      add_system=0
+    /^    logs\/system_logs:/ {
+      has_system_pipeline=1
     }
 
-    /logs\/vault_server_logs:/ {
-      add_vault_server=0
+    /^    logs\/vault_server_logs:/ {
+      has_vault_server_pipeline=1
     }
 
     /^    logs\/vault_as_a_service_1:/ && !done {
-      if (add_vault_server) {
+      if (!has_vault_server_pipeline) {
         print "    logs/vault_server_logs:"
         print "      receivers: [filelog/vault_server_logs]"
         print "      processors: [memory_limiter,resourcedetection,resource,batch]"
@@ -226,7 +223,7 @@ function patch_zotel_role_config {
         print ""
       }
 
-      if (add_system) {
+      if (!has_system_pipeline) {
         print "    logs/system_logs:"
         print "      receivers: [filelog/system_logs]"
         print "      processors: [memory_limiter,resourcedetection,resource,batch]"
@@ -244,6 +241,5 @@ function patch_zotel_role_config {
 
   log "INFO" "Completed Zotel role-config patch"
 }
-
 
 Key point: do not overwrite role-config. Only patch missing receivers and pipelines.
