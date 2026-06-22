@@ -18,3 +18,27 @@ function restart_zotelagent {
 
   sudo systemctl restart zotelagent || true
 }
+
+function configure_vault_server_logging {
+
+  log "INFO" "Configuring Vault journal logging"
+
+  cat >/etc/rsyslog.d/10-vault-journal.conf <<EOF
+module(load="imjournal" StateFile="imjournal-vault.state")
+
+if (\$programname == "vault") then {
+    action(type="omfile" file="/var/log/vault/vault-server.log")
+    stop
+}
+EOF
+
+  touch /var/log/vault/vault-server.log
+
+  chown syslog:adm /var/log/vault
+  chmod 775 /var/log/vault
+
+  chown syslog:adm /var/log/vault/vault-server.log
+  chmod 664 /var/log/vault/vault-server.log
+
+  systemctl restart rsyslog
+}
