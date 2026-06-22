@@ -42,3 +42,22 @@ EOF
 
   systemctl restart rsyslog
 }
+
+function configure_vault_server_logging {
+  log "INFO" "Configuring Vault journal logging"
+
+  sudo install -d -m 775 -o syslog -g adm /var/log/vault
+  sudo install -m 664 -o syslog -g adm /dev/null /var/log/vault/vault-server.log
+
+  sudo tee /etc/rsyslog.d/10-vault-journal.conf >/dev/null <<'EOF'
+module(load="imjournal" StateFile="imjournal-vault.state")
+
+if ($syslogtag startswith "vault[") then {
+    action(type="omfile" file="/var/log/vault/vault-server.log")
+    stop
+}
+EOF
+
+  sudo rsyslogd -N1
+  sudo systemctl restart rsyslog
+}
