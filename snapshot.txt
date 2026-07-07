@@ -1,0 +1,133 @@
+Restoration Procedure from S3
+
+This procedure completely overwrites the existing Vault data store.
+
+Log in to Bastion where vault is deployed
+
+ssh into a vault instance. 
+
+ssh -i "your pem key" ubuntu@<vault instance IP>
+
+Export Vault ADDR and CACERT 
+
+export VAULT_ADDR='<vault dns>:8200' \
+export VAULT_CACERT=/etc/vault.d/tls/ca.pem
+
+Check vault status
+
+Vault status
+
+Check for Leader node 
+
+vault operator raft list-peers
+
+Exit from current node and ssh to leader node
+
+ssh -i "your pem key" ubuntu@<leader_node_ip>
+
+Export Vault ADDR and CACERT 
+
+export VAULT_ADDR='<vault dns>:8200' \
+export VAULT_CACERT=/etc/vault.d/tls/ca.pem
+export VAULT_SKIP_VERIFY=true
+
+
+Log in using a token sudo capability on the sys/storage path:
+
+vault login <token>
+
+(Optional, If restore doesn't work) Stop Vault
+
+systemctl stop vault
+
+Download snapshot from S3 
+aws s3 cp s3://<bucket_name>/<folder_name>/<snapshotname>.snap /tmp/vault.snap
+
+Or 
+
+navigate to S3 bucket → objects (your snapshot folder) → select snapshot which needs to be restored → copy S3 URI
+
+aws s3 cp <copied s3 URI> /path_to_store/<file_name>.snap
+
+Use the restore command pointing to the snapshot file:
+
+vault operator raft snapshot restore </path/to/<file_name>.snap 
+vault operator raft snapshot restore -force </path/to/<file_name>.snap
+
+(Optional, Only if you have stop vault) Restart Vault
+
+The Vault service will restart and load the state from the restored snapshot:
+
+systemctl start vault
+
+Cross Region Replication S3
+
+Replication Bucket Region
+us-east-1
+
+
+Steps to Verify Cross Region Replication is Configured for Primary Bucket
+
+Navigate to AWS Account → Select Primary Bucket → Select Management Tab → Check the configuration in Replication Rule section → Verify destination region
+
+Snapshots are Stored in Primary Bucket, AWS automatically replicates snapshot to Replication Bucket. 
+Restoration Procedure from Replication S3
+
+This procedure completely overwrites the existing Vault data store.
+
+Log in to Bastion where vault is deployed
+
+ssh into a vault instance. 
+
+ssh -i "your pem key" ubuntu@<vault instance IP>
+
+
+Export Vault ADDR and CACERT 
+
+export VAULT_ADDR='<vault dns>:8200' \
+export VAULT_CACERT=/etc/vault.d/tls/ca.pem
+
+Check vault status
+
+Vault status
+
+Check for Leader node 
+
+vault operator raft list-peers
+
+ssh to leader node
+
+ssh -i "your pem key" ubuntu@<leader_node_ip>
+
+Export Vault ADDR and CACERT 
+
+export VAULT_ADDR='<vault dns>:8200' \
+export VAULT_CACERT=/etc/vault.d/tls/ca.pem
+export VAULT_SKIP_VERIFY=true
+
+Log in using a token sudo capability on the sys/storage path:
+
+vault login <token>
+
+Stop Vault
+
+systemctl stop vault
+
+Download snapshot from S3
+
+aws s3 cp s3://<bucket_name>/<folder_name>/<snapshotname>.snap /tmp/vault.snap
+Or 
+
+navigate to S3 replication bucket → objects (your snapshot folder) → select snapshot which needs to be restored → copy S3 URI
+
+aws s3 cp <copied s3 URI> /path_to_store/<file_name>.snap
+
+Use the restore command pointing to the snapshot file:
+
+vault operator raft snapshot restore </path/to/<file_name>.snap
+
+Restart Vault
+
+The Vault service will restart and load the state from the restored snapshot:
+
+systemctl start vault
