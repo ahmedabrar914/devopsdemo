@@ -4,97 +4,89 @@
 %---------------------------------------------------------------
 \documentclass[letterpaper,10pt]{article}
 
-\usepackage[top=0.4in,bottom=0.4in,left=0.5in,right=0.5in]{geometry}
+\usepackage[top=0.35in,bottom=0.35in,left=0.5in,right=0.5in]{geometry}
 \usepackage[hidelinks]{hyperref}
 \usepackage{enumitem}
 \usepackage{titlesec}
-\usepackage{parskip}
 \usepackage{lmodern}
 \usepackage[T1]{fontenc}
 \usepackage[utf8]{inputenc}
 
 \pagenumbering{gobble}
 \setlength{\parindent}{0pt}
-\setlength{\parskip}{1pt}
-\linespread{0.98}
-\setlist[itemize]{leftmargin=1.1em, itemsep=0pt, topsep=1pt, parsep=0pt}
+\setlength{\parskip}{0pt}
+\linespread{0.96}
+\setlist[itemize]{leftmargin=1.05em, itemsep=0pt, topsep=0pt, parsep=0pt}
 
 \titleformat{\section}
-  {\vspace{1pt}\bfseries\normalsize\uppercase}
-  {}{0em}{}[\vspace{-5pt}\hrulefill]
-\titlespacing*{\section}{0pt}{4pt}{2pt}
+  {\vspace{0pt}\bfseries\normalsize\uppercase}
+  {}{0em}{}[\vspace{-6pt}\hrulefill]
+\titlespacing*{\section}{0pt}{3pt}{1pt}
 
 \newcommand{\role}[4]{%
-  \noindent\textbf{#1} \textbar{} \textbf{#2} \hfill #3\\
-  \textit{#4}\vspace{1pt}
+  \vspace{2pt}\noindent\textbf{#1} \textbar{} \textbf{#2} \hfill #3\\
+  \textit{#4}\vspace{0pt}
 }
 
 \begin{document}
 
 %---------------- HEADER ----------------
 \begin{center}
-    {\Large \textbf{ABRAR AHMED}}\\[1pt]
-    {\small Senior DevOps / Cloud Engineer}\\[1pt]
-    {\small Bangalore, India \textbar{} +91-7619279199 \textbar{}
-    \href{mailto:ahmedabrar914@gmail.com}{ahmedabrar914@gmail.com} \textbar{}
+    {\Large \textbf{ABRAR AHMED}}\\[0pt]
+    {\small Senior DevOps / Cloud Engineer \textbar{} Bangalore, India \textbar{} +91-7619279199}\\[0pt]
+    {\small \href{mailto:ahmedabrar914@gmail.com}{ahmedabrar914@gmail.com} \textbar{}
     \href{https://linkedin.com/in/abrar-ahmed-628960150}{linkedin.com/in/abrar-ahmed-628960150}}
 \end{center}
 
 %---------------- SUMMARY ----------------
-\section*{Professional Summary}
-Senior DevOps / Cloud Engineer with 5 years of experience designing, automating, securing, and operating cloud-native infrastructure on AWS and GCP. Expert in Kubernetes (EKS/GKE), Terraform-based IaC, CI/CD, HashiCorp Vault Enterprise, DR architecture, and observability. Proven record delivering production-grade platforms for banking, security, and healthcare enterprises with strong focus on reliability, cost, and automation.
+\section*{Summary}
+Senior DevOps/Cloud Engineer with 5 years of experience designing, automating, and operating cloud-native infrastructure on AWS and GCP. Expert in Kubernetes (EKS/GKE), Terraform IaC, CI/CD, HashiCorp Vault Enterprise, DR architecture, and observability. Proven delivery of production platforms for banking, security, and healthcare with strong focus on reliability, cost, and automation.
 
 %---------------- SKILLS ----------------
 \section*{Technical Skills}
 \textbf{Cloud:} AWS (EC2, EKS, Lambda, S3, IAM, VPC, ALB/NLB, Route53, KMS, Secrets Manager, SSM, CloudWatch, CloudFormation), GCP (GKE, Cloud Run, Cloud SQL, Pub/Sub, Secret Manager)\\
-\textbf{Kubernetes \& Containers:} Kubernetes, EKS, GKE, Docker, Helm, Istio, ArgoCD\\
-\textbf{IaC \& Automation:} Terraform, Terragrunt, CloudFormation, Ansible, Python, Bash, Groovy\\
-\textbf{CI/CD:} Jenkins, GitLab CI, GitHub Actions, ArgoCD, Git, Gerrit\\
-\textbf{Security \& Secrets:} HashiCorp Vault Enterprise (DR, KMS Auto-Unseal, TLS, Snapshots), External Secrets Operator, Okta, IAM, AWS Secrets Manager\\
-\textbf{Observability:} Prometheus, Grafana, OpenTelemetry, CloudWatch, rsyslog, systemd-journald, logrotate\\
-\textbf{Databases \& OS:} PostgreSQL, MySQL, Linux (Ubuntu, Amazon Linux)\\
-\textbf{Methodologies:} SRE, Agile/Scrum, Kanban, Incident Response, RCA, On-Call
+\textbf{Kubernetes \& IaC:} Kubernetes, EKS, GKE, Docker, Helm, Istio, ArgoCD, Terraform, Terragrunt, CloudFormation, Ansible\\
+\textbf{CI/CD \& SCM:} Jenkins, GitLab CI, GitHub Actions, ArgoCD, Git, Gerrit\\
+\textbf{Security \& Secrets:} HashiCorp Vault Enterprise (DR, KMS Auto-Unseal, TLS, Snapshots), External Secrets Operator, Okta SSO, IAM, AWS Secrets Manager\\
+\textbf{Observability:} Prometheus, Grafana, OpenTelemetry, CloudWatch, ELK, rsyslog, systemd-journald, logrotate\\
+\textbf{Programming:} Python, Bash, Shell, Groovy, YAML \textbar{} \textbf{DB \& OS:} PostgreSQL, MySQL, Linux (Ubuntu, Amazon Linux)\\
+\textbf{Practices:} SRE, DR/BCP, Incident Response, RCA, On-Call, Agile/Scrum, Kanban, GitOps, Cost Optimization
 
 %---------------- EXPERIENCE ----------------
 \section*{Professional Experience}
 
 \role{Senior Software Development Engineer -- DevOps}{Zscaler}{Dec 2025 -- Present}{Bangalore, India}
 \begin{itemize}
-    \item Designed and operate highly available HashiCorp Vault Enterprise on AWS using Terraform modules and EC2 Auto Scaling, following IaC best practices.
-    \item Architected multi-region Vault Disaster Recovery using Enterprise DR Replication; automated failover/failback workflows and pre-flight replication health checks.
-    \item Implemented automated Vault snapshots to S3 with cross-region replication, Object Lock, and lifecycle retention; managed AWS KMS Auto-Unseal and TLS certificate rotation.
-    \item Built GitLab CI/CD pipelines and Bash/Python automation via AWS SSM for Vault provisioning, DR ops, and operational validation.
+    \item Designed and operate HA HashiCorp Vault Enterprise on AWS using Terraform modules and EC2 Auto Scaling; architected multi-region Vault DR with Enterprise Replication.
+    \item Automated Vault snapshot backups to S3 with cross-region replication, Object Lock, and lifecycle retention; managed AWS KMS Auto-Unseal and TLS certificate rotation.
+    \item Built GitLab CI/CD pipelines and Bash/Python automation via AWS SSM for Vault provisioning, DR failover/failback, and operational validation.
     \item Integrated Vault logs into centralized observability via OpenTelemetry; tuned rsyslog, systemd-journald, and logrotate for compliance.
     \item Led production incident response, RCA, and on-call for Vault DR, certificate, and Linux/systemd issues; authored runbooks improving MTTR.
 \end{itemize}
 
 \role{Senior Cloud Engineer}{Searce Inc.\ (Client: HDFC Bank -- Performance Engineering)}{Jan 2025 -- Dec 2025}{Bangalore, India}
 \begin{itemize}
-    \item Architected multi-AZ GKE production clusters with autoscaling and PodDisruptionBudgets, ensuring high availability during peak banking traffic.
-    \item Provisioned VPCs, GKE node pools, Cloud SQL, and Secret Manager with Terraform, Python, and Bash for reproducible dev/UAT/prod environments.
-    \item Standardized deployments into versioned Helm charts with CI-integrated \texttt{values.yaml} and multi-env promotion logic; resolved production incidents (CrashLoopBackOff, OOMKilled, probe failures, CoreDNS latency, cgroup limits).
+    \item Architected multi-AZ GKE production clusters with autoscaling and PodDisruptionBudgets, ensuring HA during peak banking traffic.
+    \item Provisioned VPCs, GKE node pools, Cloud SQL, and Secret Manager via Terraform, Python, and Bash for reproducible dev/UAT/prod; standardized Helm-based multi-env deployments.
+    \item Resolved production incidents (CrashLoopBackOff, OOMKilled, probe failures, CoreDNS latency, cgroup limits), reducing Kubernetes MTTR.
     \item Built Jenkins pipeline automating JMeter performance tests with Teams/Outlook reporting, cutting manual execution effort by \textbf{80\%}.
 \end{itemize}
 
 \role{Senior Cloud Engineer}{Reltio (Contract)}{Jun 2024 -- Dec 2024}{Bangalore, India}
 \begin{itemize}
-    \item Integrated External Secrets Operator with HashiCorp Vault, replacing Git-based secret management and eliminating credential exposure risk.
-    \item Deployed NetBox IPAM across multi-cloud; automated real-time sync via Python and AWS Lambda; drove cost/latency wins by removing Istio-based router.
-    \item Integrated Okta SSO for secure user access and RBAC; hardened Vault services for distributed workloads.
+    \item Integrated External Secrets Operator with HashiCorp Vault, replacing Git-based secret management; hardened Vault for distributed workloads.
+    \item Deployed NetBox IPAM across multi-cloud; automated real-time sync via Python and AWS Lambda; cut cost/latency by removing Istio-based router; integrated Okta SSO.
 \end{itemize}
 
 \role{Associate Software Engineer -- DevOps}{Greenway Health}{Sep 2021 -- Jun 2024}{Remote}
 \begin{itemize}
-    \item Designed and managed AWS VPCs, subnets, security groups, and load balancers for healthcare SaaS workloads.
-    \item Built and maintained Jenkins CI/CD pipelines and Docker-based deployments, improving release frequency, scalability, and environment consistency.
+    \item Managed AWS VPCs, subnets, security groups, and load balancers for healthcare SaaS; built Jenkins CI/CD and Docker-based deployments improving release frequency and consistency.
 \end{itemize}
 
-%---------------- PROJECTS ----------------
+%---------------- PROJECTS + EDUCATION (compact) ----------------
 \section*{Key Projects}
-\textbf{Vault Backup \& Recovery Platform:} Automated Vault Integrated Storage snapshots to S3 with cross-region replication, Object Lock, and lifecycle retention; validated DR restores during game-day exercises.\\
-\textbf{Automated CI/CD on AWS:} Serverless CI/CD using CodePipeline, CodeBuild, Lambda, S3, and CloudFormation IaC; Python/Bash automation reducing manual ops effort.
+\textbf{Vault Backup \& Recovery Platform:} Automated Vault snapshots to S3 with cross-region replication, Object Lock, and lifecycle retention; validated DR restores during game-day drills. \textbf{Automated CI/CD on AWS:} Serverless pipeline using CodePipeline, CodeBuild, Lambda, S3, and CloudFormation with Python/Bash automation.
 
-%---------------- EDUCATION ----------------
 \section*{Education}
 \textbf{Bachelor of Engineering, Computer Science and Engineering} \hfill Jun 2018 -- Jul 2021\\
 Nitte Meenakshi Institute of Technology, Bangalore \textbar{} CGPA: 7.4/10 \textbar{} Accountability Excellence Award
