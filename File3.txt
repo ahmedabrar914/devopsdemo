@@ -1,1 +1,91 @@
-test demo
+I’ve drafted a strong, evidence-based FY2026 performance report for Q3 (Feb–Apr) and Q4 (May–Jul) based on the work captured across your history tabs. The wording is aligned with the sheet’s instructions: focus on outcomes, impact, ownership, collaboration, and learning, not just a list of activities.
+You can copy these entries directly into the respective KR rows in your Google Sheet.
+Q3 (Feb–Apr)
+KR1: Vault HVD deployment and infrastructure stabilization
+Section Content to paste
+Key Result Successfully supported and stabilized the Vault HVD deployment in AWS, ensuring secure, highly available, and production-ready infrastructure for the ZVault platform.
+Key Actions Collaborated with the team to configure and validate Vault HVD deployment on AWS EC2 with Auto Scaling.
+Supported AWS KMS auto-unseal configuration and validated secure initialization workflows.
+Contributed to server.hcl configuration updates, audit logging, telemetry, and operational hardening.
+Assisted in troubleshooting deployment and configuration issues to ensure stable cluster operations.
+Work Products Vault HVD deployment configuration
+AWS KMS auto-unseal setup
+Server.hcl updates
+Audit logging and telemetry configuration
+Ownership & Collaboration Worked closely with platform and security teams to validate deployment configurations, troubleshoot issues, and ensure the ZVault platform met operational and security requirements.
+Trust through Outcomes and Impact Contributed to a stable and secure Vault infrastructure, reducing deployment risks and improving the reliability of the ZVault platform for critical secret management operations.
+A challenge culture and ongoing feedback Actively sought feedback during deployment troubleshooting and applied learnings to improve configuration accuracy and operational stability.
+KR2: Vault snapshot backup and S3 replication automation
+Section Content to paste
+Key Result Implemented and enhanced automated Vault snapshot backup and S3 replication workflows, improving data protection and disaster recovery readiness.
+Key Actions Configured automated Vault Raft snapshots to a private S3 bucket.
+Implemented S3 object lock and cross-region replication for disaster recovery.
+Updated backup retention policies from 30 days to 13 months based on business requirements.
+Debugged and resolved snapshot replication issues in Terraform configurations.
+Work Products Terraform code for S3 snapshot buckets
+Object lock configuration
+Cross-region replication setup
+Backup retention policy updates
+Ownership & Collaboration Took ownership of troubleshooting replication failures and collaborated with stakeholders to align backup retention and disaster recovery requirements.
+Trust through Outcomes and Impact Improved backup reliability and ensured long-term retention compliance, strengthening the organization’s disaster recovery preparedness.
+A challenge culture and ongoing feedback Identified gaps in the initial replication setup, incorporated feedback, and refined the automation to ensure consistent snapshot replication.
+KR3: Terraform and infrastructure automation
+Section Content to paste
+Key Result Enhanced infrastructure automation using Terraform, improving consistency, scalability, and maintainability of AWS resources.
+Key Actions Worked on Terraform modules for VPC, ALB, ECS, RDS, and related AWS infrastructure.
+Managed tfvars configurations for primary and DR environments.
+Validated Terraform plan/apply workflows to prevent unintended infrastructure changes.
+Supported infrastructure troubleshooting, including VPC peering and resource dependency management.
+Work Products Terraform infrastructure code
+Environment-specific tfvars files
+VPC peering configurations
+Infrastructure validation documentation
+Ownership & Collaboration Collaborated with engineering teams to validate infrastructure changes and ensure safe deployment practices.
+Trust through Outcomes and Impact Reduced configuration drift and improved the reliability of infrastructure provisioning across environments.
+A challenge culture and ongoing feedback Proactively reviewed Terraform changes, raised potential risks, and incorporated team feedback to improve deployment safety.
+Q4 (May–Jul)
+KR1: Vault DR replication and failover automation
+Section Content to paste
+Key Result Designed and automated Vault DR replication, failover, and failback workflows, significantly improving disaster recovery readiness for the ZVault platform.
+Key Actions Automated Vault DR replication enablement and validation workflows.
+Developed idempotent scripts for controlled failover and failback operations.
+Integrated DR automation with GitLab CI pipelines using SSM commands through bastion hosts.
+Implemented retry logic and replication status validation to ensure reliable execution.
+Work Products GitLab CI pipeline for DR replication
+Failover and failback automation scripts
+SSM command execution workflows
+DR validation documentation
+Ownership & Collaboration Took ownership of the DR automation initiative and collaborated with platform engineers to validate replication, failover, and recovery scenarios.
+Trust through Outcomes and Impact Reduced manual intervention during DR operations, minimized recovery risks, and improved the organization’s ability to recover critical Vault services quickly.
+A challenge culture and ongoing feedback Iteratively improved the DR workflow by incorporating feedback from testing, ensuring the automation was resilient and production-ready.
+KR2: GitLab CI/CD pipeline enhancement
+Section Content to paste
+Key Result Enhanced GitLab CI/CD pipelines for Vault infrastructure operations, improving deployment automation and operational efficiency.
+Key Actions Configured multi-stage GitLab CI pipelines for validation, Terraform plan/apply, Vault initialization, and DR replication.
+Implemented OIDC-based AWS role assumption for secure pipeline execution.
+Added automated checks for Terraform formatting, security scanning, and deployment validation.
+Improved pipeline reliability by handling environment-specific deployment dependencies.
+Work Products GitLab CI YAML configurations
+OIDC role assumption setup
+Terraform validation stages
+Deployment automation workflows
+Ownership & Collaboration Worked with DevOps and security teams to ensure the CI/CD pipeline met operational, security, and compliance standards.
+Trust through Outcomes and Impact Improved deployment consistency, reduced manual errors, and accelerated infrastructure delivery for the ZVault platform.
+A challenge culture and ongoing feedback Continuously refined pipeline stages based on testing outcomes and peer feedback to improve reliability and maintainability.
+KR3: Operational stability, logging, and monitoring
+Section Content to paste
+Key Result Improved operational stability of the Vault platform through enhanced logging, monitoring, and production issue resolution.
+Key Actions Configured rsyslog and logrotate for Vault journal and audit logs.
+Resolved log rotation issues affecting /var/log/vault/vault-journalctl.log.
+Created and validated log-based alerts for audit backend failures and quorum loss scenarios.
+Troubleshot SSM agent, certificate, and Vault UI visibility issues.
+Work Products Rsyslog configuration updates
+Logrotate fixes
+Grafana/Kfuse alert configurations
+Operational troubleshooting documentation
+Ownership & Collaboration Actively supported production operations by diagnosing issues, coordinating with relevant teams, and implementing corrective actions.
+Trust through Outcomes and Impact Improved observability and reduced the risk of prolonged production incidents by ensuring reliable logging and proactive alerting.
+A challenge culture and ongoing feedback Learned from production troubleshooting experiences and applied corrective actions to prevent recurrence of operational issues.
+Overall performance summary (paste in final comments if needed)
+During FY2026 Q3 and Q4, I made significant contributions to the ZVault platform by supporting Vault HVD deployment, automating disaster recovery workflows, enhancing GitLab CI/CD pipelines, and improving operational stability through logging and monitoring. My work focused on delivering measurable outcomes, including improved disaster recovery readiness, reduced manual intervention, stronger infrastructure reliability, and enhanced observability for production systems. I collaborated effectively with cross-functional teams, proactively identified risks, and continuously incorporated feedback to deliver secure, scalable, and high-quality solutions aligned with business and operational goals.
+This version is intentionally written to present your work as outcome-focused and high-impact, which is exactly what managers look for in a strong performance evaluation.
