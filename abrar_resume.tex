@@ -1,0 +1,135 @@
+\documentclass[a4paper,10pt]{article}
+
+\usepackage[top=0.55in,bottom=0.55in,left=0.62in,right=0.62in]{geometry}
+\usepackage[hidelinks]{hyperref}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{parskip}
+\usepackage{lmodern}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+
+\pagenumbering{gobble}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{2pt}
+\setlist[itemize]{leftmargin=1.2em, itemsep=1pt, topsep=2pt, parsep=0pt}
+
+\titleformat{\section}
+  {\bfseries\normalsize\uppercase}
+  {}{0em}{}[\vspace{-4pt}\hrulefill]
+\titlespacing*{\section}{0pt}{7pt}{3pt}
+
+\newcommand{\role}[4]{%
+  \noindent\textbf{#1} \textbar{} \textbf{#2} \hfill #3\\
+  \textit{#4}\vspace{1pt}
+}
+
+\begin{document}
+
+\begin{center}
+    {\LARGE \textbf{ABRAR AHMED}}\\[2pt]
+    {\normalsize Senior DevOps Engineer \textbar{} Cloud Platform \textbar{} SRE Practices}\\[2pt]
+    Bangalore, India \textbar{} +91-7619279199 \textbar{}
+    \href{mailto:ahmedabrar914@gmail.com}{ahmedabrar914@gmail.com} \textbar{}
+    \href{https://linkedin.com/in/abrar-ahmed-628960150}{linkedin.com/in/abrar-ahmed-628960150}
+\end{center}
+
+\section*{Professional Summary}
+Senior DevOps Engineer with \textbf{5+ years} of experience building secure, scalable, and highly available cloud platforms across \textbf{AWS} and \textbf{GCP}. Hands-on expertise in \textbf{Kubernetes (EKS/GKE)}, \textbf{Terraform-based Infrastructure as Code}, \textbf{CI/CD automation}, \textbf{HashiCorp Vault Enterprise}, and \textbf{multi-region disaster recovery}. Proven track record delivering production-critical systems for security, banking, and healthcare organizations by improving reliability, reducing manual toil, and strengthening operational readiness. Strong background in Linux systems, incident response, observability, and cross-functional execution with Security, SRE, and development teams.
+
+\section*{Core Competencies}
+Cloud Infrastructure Architecture \textbar{} Kubernetes Platform Engineering \textbar{} Infrastructure as Code \textbar{} CI/CD and Release Automation \textbar{} Site Reliability Engineering \textbar{} Secrets and Key Management \textbar{} Disaster Recovery and Business Continuity \textbar{} Monitoring, Logging, and Alerting \textbar{} Production Incident Response \textbar{} Performance and Cost Optimization
+
+\section*{Technical Skills}
+\textbf{Cloud Platforms:} AWS (EC2, EKS, Lambda, S3, IAM, VPC, ALB/NLB, Route53, KMS, Secrets Manager, SSM, CloudWatch, CloudFormation, EBS, SQS), GCP (GKE, Cloud Run, Cloud SQL, Pub/Sub, Secret Manager)\\
+\textbf{Containers and Orchestration:} Kubernetes, EKS, GKE, Docker, Helm, Istio, ArgoCD, HPA/VPA, PodDisruptionBudgets, CoreDNS\\
+\textbf{Infrastructure as Code:} Terraform, Terragrunt, CloudFormation, Ansible, reusable modules, multi-environment provisioning\\
+\textbf{CI/CD and GitOps:} Jenkins, GitLab CI, GitHub Actions, ArgoCD, AWS CodePipeline, CodeBuild, Git, GitHub, GitLab, Gerrit\\
+\textbf{Security and Secrets:} HashiCorp Vault Enterprise (DR Replication, KMS Auto-Unseal, TLS, Snapshot Operations), External Secrets Operator, AWS Secrets Manager, Okta SSO, IAM, RBAC\\
+\textbf{Observability:} Prometheus, Grafana, OpenTelemetry, CloudWatch, ELK, audit logging, alerting, SLO-focused monitoring\\
+\textbf{Programming and Scripting:} Python, Bash, Shell, Groovy, YAML\\
+\textbf{Networking and OS:} VPC, DNS, Route53, Security Groups, Load Balancers, Nginx, NetBox IPAM, Linux (Ubuntu, Amazon Linux, RHEL)\\
+\textbf{Data and Delivery Practices:} PostgreSQL, MySQL, Agile, Scrum, Kanban, RCA, on-call ownership, DR drills
+
+\section*{Professional Experience}
+
+\role{Senior Software Development Engineer -- DevOps}{Zscaler}{Dec 2025 -- Present}{Bangalore, India}
+\begin{itemize}
+    \item Designed and operate highly available \textbf{HashiCorp Vault Enterprise} clusters on AWS using Terraform and EC2 Auto Scaling, supporting production-critical secret management.
+    \item Built reusable Terraform modules and standardized provisioning workflows to enforce Infrastructure as Code controls across multiple environments.
+    \item Architected \textbf{multi-region Vault DR replication} and automated failover/failback workflows, reducing manual intervention during recovery events.
+    \item Automated pre-failover and post-failover validation checks for replication health, synchronization consistency, and cluster readiness.
+    \item Implemented automated Vault snapshot backups to Amazon S3 with cross-region replication, Object Lock, and lifecycle policies for immutable retention.
+    \item Managed KMS Auto-Unseal, TLS certificate rotation, SAN validation, and secure bootstrap handling for enterprise-grade deployments.
+    \item Integrated AWS Secrets Manager for controlled credential lifecycle and secure handling of operational certificates.
+    \item Developed Bash/Python automation executed through AWS Systems Manager for Vault initialization, verification, and environment bring-up.
+    \item Built GitLab CI pipelines for infrastructure provisioning, DR operations, and repeatable deployment workflows.
+    \item Integrated Vault audit/system logs using OpenTelemetry and tuned rsyslog, systemd-journald, and logrotate to satisfy compliance and retention requirements.
+    \item Created operational dashboards and proactive alerts for cluster quorum, audit failure, replication status, and infrastructure health.
+    \item Led incident response and post-incident RCA for critical services, improving runbook quality and reducing time to recovery.
+\end{itemize}
+
+\role{Senior Cloud Engineer}{Searce Inc. (Client: HDFC Bank -- Performance Engineering)}{Jan 2025 -- Dec 2025}{Bangalore, India}
+\begin{itemize}
+    \item Architected and managed production-grade \textbf{GKE} clusters with multi-zone resiliency, autoscaling, and PodDisruptionBudgets for high-traffic banking workloads.
+    \item Diagnosed and resolved production issues including CrashLoopBackOff, OOMKilled states, DNS degradation, and readiness/liveness probe instability.
+    \item Performed deep troubleshooting at pod, container, and kernel cgroup levels to improve workload stability and deployment success.
+    \item Wrote Terraform, Python, and Bash automation for VPCs, node pools, Cloud SQL, and Secret Manager across dev, UAT, and production.
+    \item Standardized service deployments through versioned Helm charts and controlled promotion logic with environment-specific values.
+    \item Designed and implemented a Jenkins-based JMeter framework with automated result delivery to Outlook and Teams, reducing manual test execution effort by \textbf{80\%}.
+\end{itemize}
+
+\role{Platform Engineer}{Reltio (Contract)}{Jun 2024 -- Dec 2024}{Bangalore, India}
+\begin{itemize}
+    \item Improved reliability and operational efficiency through infrastructure automation and platform hardening across cloud environments.
+    \item Replaced Git-based secret handling by integrating External Secrets Operator with HashiCorp Vault for secure runtime secret consumption.
+    \item Implemented NetBox IPAM and automated near real-time synchronization using Python and AWS Lambda.
+    \item Operated and maintained Vault for distributed services, ensuring secure secret access patterns and stable authentication workflows.
+    \item Reduced latency and platform overhead by retiring unnecessary routing layers and eliminating Istio where lightweight ingress met service requirements.
+    \item Integrated Okta SSO and RBAC for secure, centralized user access and policy governance.
+\end{itemize}
+
+\role{Associate Software Engineer -- DevOps}{Greenway Health}{Sep 2021 -- Jun 2024}{Remote}
+\begin{itemize}
+    \item Managed AWS networking foundations including VPCs, subnets, security groups, and load balancers for healthcare SaaS environments.
+    \item Built and maintained Jenkins CI/CD pipelines to automate deployments, improve release consistency, and reduce manual steps.
+    \item Containerized applications using Docker to improve portability, scaling behavior, and environment parity.
+    \item Supported infrastructure maintenance and release operations with a strong focus on reliability and uptime.
+    \item Maintained clear technical documentation and runbooks, enabling faster onboarding and improved on-call response.
+\end{itemize}
+
+\newpage
+
+\section*{Selected DevOps Projects}
+\textbf{Vault Backup and Recovery Platform}\\
+Designed and implemented automated snapshot orchestration for Vault integrated storage, including encrypted snapshot storage in Amazon S3, cross-region replication, immutable retention with Object Lock, and repeatable restoration validation through DR drills.
+
+\textbf{Automated Deployment Platform with AWS CodePipeline}\\
+Built a serverless deployment framework using AWS CodePipeline, CodeBuild, Lambda, S3, EC2, SQS, IAM, EBS, and CloudWatch. Authored CloudFormation templates and Python/Bash automation to improve deployment consistency, observability, and throughput.
+
+\textbf{Performance Testing Automation Pipeline}\\
+Designed Jenkins-driven performance test automation that executes JMeter workloads remotely, processes result artifacts, and distributes summaries to stakeholder channels (Outlook, Teams), enabling repeatable benchmarking and faster feedback loops.
+
+\section*{Leadership and Collaboration}
+\begin{itemize}
+    \item Worked closely with Security, SRE, Infrastructure, and application teams to align platform reliability, compliance, and delivery goals.
+    \item Owned production support rotations and contributed to incident command, recovery execution, and root-cause analysis.
+    \item Authored operational runbooks and troubleshooting guides to improve team velocity and reduce repeated operational toil.
+    \item Drove engineering hygiene through Infrastructure as Code standards, reusable modules, and environment consistency practices.
+\end{itemize}
+
+\section*{Education}
+\textbf{Bachelor of Engineering, Computer Science and Engineering} \hfill Jun 2018 -- Jul 2021\\
+Nitte Meenakshi Institute of Technology, Bangalore \textbar{} CGPA: 7.4/10
+
+\section*{Certifications and Recognition}
+\begin{itemize}
+    \item AWS Certified Developer -- Associate (Pluralsight)
+    \item AWS DevOps Certification -- GeeksforGeeks
+    \item Accountability Excellence Award for consistent delivery, ownership, and team contribution.
+\end{itemize}
+
+\section*{Target Roles}
+Senior DevOps Engineer \textbar{} Site Reliability Engineer \textbar{} Cloud Platform Engineer \textbar{} Infrastructure Engineer
+
+\end{document}
